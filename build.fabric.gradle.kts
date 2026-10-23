@@ -222,15 +222,21 @@ tasks.named<ProcessResources>("processResources") {
         } else {
             ""
         },
-        // The ranges this jar declares, computed the same way the NeoForge script computes its
-        // own -- a literal in a shared resource file is right on exactly one node. See that
-        // script for the full reasoning; the short version is that the upper bound is closed on
-        // purpose, because an open-ended range claims compatibility with releases nothing here
-        // has been run against.
+        // The ranges this jar declares. The bounds are the same policy as the NeoForge script's --
+        // one Minecraft release, upper bound closed on purpose -- but the SYNTAX is not, and that
+        // difference is the whole reason this is not shared code.
+        //
+        // NeoForge takes Maven range notation: "[1.21.11,1.21.12)". Fabric's VersionPredicate takes
+        // space-separated comparators: ">=1.21.11 <1.21.12". Written the Maven way, Fabric does not
+        // reject the jar -- it evaluates the predicate to FALSE for every game version, so the mod is
+        // reported as incompatible with the very release it was built for. Measured against
+        // fabric-loader's own VersionPredicate: "[1.20.1,1.20.2)" is false for 1.20.1, and
+        // "[1.21.11,1.21.12)" is false for 1.21.11. The comparator form is true for the named version
+        // and false for the one before and the one after, which is what the range is for.
         "minecraft_range" to run {
             val parts = minecraftVersion.split(".")
             val next = (parts.dropLast(1) + (parts.last().toInt() + 1).toString()).joinToString(".")
-            "[$minecraftVersion,$next)"
+            ">=$minecraftVersion <$next"
         },
     )
     // The NeoForge mod metadata lives in src/main/resources, which every node shares, so without this
@@ -246,4 +252,22 @@ tasks.named<ProcessResources>("processResources") {
     filesMatching(listOf("fabric.mod.json")) { expand(replaceProperties) }
     // MIT requires the notice to travel with every copy, and the copy people receive is the jar.
     from(rootProject.file("LICENSE")) { into("META-INF") }
+
+    // The data pack, assembled for this node -- same three-way choice the NeoForge script makes,
+    // and for the same reasons. See the long comment there; the short version is that the data
+    // directory is plural before 1.21.1, the ingredient is an object before 1.21.4, and 1.20.5
+    // renamed the result's "item" to "id". Stonecutter does not touch resources, so the choice has
+    // to be made at copy time.
+    val recipeEra = when {
+        stonecutter.eval(minecraftVersion, ">=1.21.4") -> "recipe-modern"
+        stonecutter.eval(minecraftVersion, ">=1.20.5") -> "recipe-mid"
+        else -> "recipe-legacy"
+    }
+    val singular = stonecutter.eval(minecraftVersion, ">=1.21.1")
+    from(rootProject.file("src/main/datapack/$recipeEra")) {
+        into("data/howtogo/" + if (singular) "recipe" else "recipes")
+    }
+    from(rootProject.file("src/main/datapack/advancement")) {
+        into("data/howtogo/" + if (singular) "advancement/recipes" else "advancements/recipes")
+    }
 }
