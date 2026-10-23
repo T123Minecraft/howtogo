@@ -406,6 +406,8 @@ public final class DestinationPickerPage implements IPhonePage {
         PoseStack pose = canvas.graphics().pose();
         VertexConsumer quads = HudDraw.consumer(canvas.graphics());
         PoseStack.Pose last = pose.last();
+//        将 last 和 quads 包装成新版的 VertexSink
+        HudDraw.VertexSink sink = HudDraw.sink(last, quads);
 
         int minX = mapLeft();
         int minY = mapTop();
@@ -420,15 +422,15 @@ public final class DestinationPickerPage implements IPhonePage {
         canvas.clipped(minX, minY, maxX, maxY, () -> {
             // One stroke per road (a chain of segments), not one per segment: the joints between
             // pieces are what read as jagged on a small map, whichever mod the road came from.
-            HudDraw.emitNetwork(last, quads, RoadStore.get(),
+            HudDraw.emitNetwork(sink, RoadStore.get(),
                     pixelsPerBlock, 0, mapCentreScreenX() - mapCenterX * pixelsPerBlock,
                     0, pixelsPerBlock, mapCentreScreenZ() - mapCenterZ * pixelsPerBlock,
                     0.7, 0x9A, minX, minY, maxX, maxY);
-            HudDraw.emitNetwork(last, quads, RailTrackStore.network(),
+            HudDraw.emitNetwork(sink, RailTrackStore.network(),
                     pixelsPerBlock, 0, mapCentreScreenX() - mapCenterX * pixelsPerBlock,
                     0, pixelsPerBlock, mapCentreScreenZ() - mapCenterZ * pixelsPerBlock,
                     0.7, 0x9A, minX, minY, maxX, maxY);
-            HudDraw.emitNetwork(last, quads, MtrTransit.railLayer(),
+            HudDraw.emitNetwork(sink, MtrTransit.railLayer(),
                     pixelsPerBlock, 0, mapCentreScreenX() - mapCenterX * pixelsPerBlock,
                     0, pixelsPerBlock, mapCentreScreenZ() - mapCenterZ * pixelsPerBlock,
                     0.7, 0x9A, minX, minY, maxX, maxY);
@@ -443,7 +445,7 @@ public final class DestinationPickerPage implements IPhonePage {
                 if (outside(px, pz, minX, minY, maxX, maxY, HudDraw.PLACE_MARKER_SMALL_PX)) {
                     continue;
                 }
-                HudDraw.emitPlaceMarker(last, quads, px, pz,
+                HudDraw.emitPlaceMarker(sink, px, pz,
                         HudDraw.PLACE_MARKER_SMALL_PX * 0.5, HudDraw.COLOR_PLACE);
             }
             Destination pick = marked;
@@ -451,7 +453,7 @@ public final class DestinationPickerPage implements IPhonePage {
                 double px = toScreenX(pick.x());
                 double pz = toScreenZ(pick.z());
                 if (!outside(px, pz, minX, minY, maxX, maxY, HudDraw.PLACE_MARKER_SMALL_PX)) {
-                    HudDraw.emitPlaceMarker(last, quads, px, pz,
+                    HudDraw.emitPlaceMarker(sink, px, pz,
                             HudDraw.PLACE_MARKER_SMALL_PX * 0.7, 0xFFFF5555);
                 }
             }
@@ -464,8 +466,8 @@ public final class DestinationPickerPage implements IPhonePage {
                 double playerX = toScreenX(minecraft.player.getX());
                 double playerZ = toScreenZ(minecraft.player.getZ());
                 if (!outside(playerX, playerZ, minX, minY, maxX, maxY, 8.0)) {
-                    HudDraw.emitDisc(last, quads, playerX, playerZ, 3.6, 0xFF10171C, 0xFF);
-                    HudDraw.emitDisc(last, quads, playerX, playerZ, 2.4, 0xFFFFFFFF, 0xFF);
+                    HudDraw.emitDisc(sink, playerX, playerZ, 3.6, 0xFF10171C, 0xFF);
+                    HudDraw.emitDisc(sink, playerX, playerZ, 2.4, 0xFFFFFFFF, 0xFF);
                 }
             }
 
@@ -473,7 +475,7 @@ public final class DestinationPickerPage implements IPhonePage {
             // the line looked at before committing and the line drawn afterwards read as one thing.
             Navigation.RoutePreview planned = preview;
             if (planned != null && planned.isPresent()) {
-                HudDraw.emitPath(last, quads, planned.route().points(),
+                HudDraw.emitPath(sink, planned.route().points(),
                         pixelsPerBlock, 0, mapCentreScreenX() - mapCenterX * pixelsPerBlock,
                         0, pixelsPerBlock, mapCentreScreenZ() - mapCenterZ * pixelsPerBlock,
                         1.1, 0xFF2FD0FF, 0xE0, minX, minY, maxX, maxY);

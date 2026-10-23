@@ -44,7 +44,7 @@ pluginManagement {
         maven("https://maven.kikugie.dev/snapshots") { name = "KikuGie Snapshots" }
         // moddev / NeoForge. maven.neoforged.net is unreachable from this network; bmclapi
         // proxies most of it and the workspace mirror carries the rest (see the root build).
-        maven("https://bmclapi2.bangbang93.com/maven") { name = "BMCLAPI" }
+        maven("https://neoforged.forgecdn.net/releases") { name = "NeoForged CDN" }
         maven {
             name = "workspaceLocalMirror"
             url = uri(providers.gradleProperty("htgLocalMaven").getOrElse("${rootDir}/.recon/maven-local"))
