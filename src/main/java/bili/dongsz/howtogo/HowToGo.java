@@ -8,8 +8,10 @@ import bili.dongsz.howtogo.client.NavHudRenderer;
 import bili.dongsz.howtogo.client.Navigation;
 import bili.dongsz.howtogo.client.AutoSelfTest;
 import bili.dongsz.howtogo.client.MtrClientData;
+import bili.dongsz.howtogo.client.PlaceDetailStore;
 import bili.dongsz.howtogo.client.RailTrackStore;
 import bili.dongsz.howtogo.client.MapFilterOverlay;
+import bili.dongsz.howtogo.client.NavMapMode;
 import bili.dongsz.howtogo.client.MtrOverlayToggles;
 import bili.dongsz.howtogo.client.RoadEditHandler;
 import bili.dongsz.howtogo.client.RoadEditSession;
@@ -17,7 +19,7 @@ import bili.dongsz.howtogo.client.RoadLayer;
 import bili.dongsz.howtogo.client.RoadStore;
 import bili.dongsz.howtogo.client.RoadWeaverLayer;
 import bili.dongsz.howtogo.client.TransitLineStore;
-import bili.dongsz.howtogo.item.ModItems;
+import bili.dongsz.howtogo.mtr.MtrSync;
 import bili.dongsz.howtogo.store.RoutePreferenceStore;
 import bili.dongsz.howtogo.webmap.WebMapService;
 import com.mojang.logging.LogUtils;
@@ -60,10 +62,10 @@ import org.slf4j.Logger;
  * <p>So the class declaration and the entry point are written once per loader, and everything else
  * in the file -- the id, the logger and {@link #diagnostic} -- is shared and sits between them.
  */
-// The two halves are whole declarations rather than conditions inside one, for the same reason as
-// HowToGoServer: the loaders disagree about what an entry point is, so a shared shell with the
-// differences inside would be more scaffolding than code. The javadoc above stays outside, because a
-// `/** ... */` inside the `/* ... */` a condition is written with would close it early.
+// The two halves are whole declarations rather than conditions inside one: the loaders disagree
+// about what an entry point is, so a shared shell with the differences inside would be more
+// scaffolding than code. The javadoc above stays outside, because a `/** ... */` inside the
+// `/* ... */` a condition is written with would close it early.
 //? if fabric {
 /*public final class HowToGo implements ClientModInitializer {
 *///?} else {
@@ -112,6 +114,10 @@ public final class HowToGo {
         // RoadLayer polls from the client tick instead of doing it during initialisation.
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             RoadLayer.onClientTick();
+            // The display mode's own tick job: it polls Xaero's Minimap for the overlay's
+            // registration and writes the one log line that says which mode is in force and, when
+            // the answer is not what the player asked for, why. See NavMapMode.
+            NavMapMode.onClientTick();
             // The addon API's two tick jobs, and in this order: the deferred queue is drained before
             // the registration event is posted, so work queued by a registration handler waits for the
             // next tick and ClientScheduler's promise -- "the tick after the one that queued it" --
@@ -119,10 +125,29 @@ public final class HowToGo {
             ClientScheduler.tick();
             ApiBootstrap.fireOnce();
             RoadStore.tick();
+            // After the roads: the details' "unlinked" reading asks the road network which of the
+            // player's own places still exist, so it wants this tick's network rather than last
+            // tick's.
+            PlaceDetailStore.tick();
             TransitLineStore.tick();
             RailTrackStore.tick();
+            // RoadWeaver's roads: read from its client map snapshot, or from its own road store while the
+            // player hosts the world. After the stores above so a layer rebuilt this tick sees the same
+            // world they did. See RoadWeaverLayer.
+            RoadWeaverLayer.tick();
             MtrClientData.tick();
+            // Addon layers: one version comparison per registered source per tick, and a re-read only when
+            // that number has moved. After the stores above so that a layer rebuilt this tick sees the same
+            // world they did. See AddonRoadStore.
+            AddonRoadStore.tick();
             RoadEditSession.tick();
+            // The main screen's key, read from the tick because it is a key for the world rather
+            // than for a screen; see RoadEditHandler.tickMainMenuKey. The K key is the mod's only
+            // way in now, so it is registered and read on both loaders.
+            RoadEditHandler.tickMainMenuKey();
+            // MTR Map Overlay resets its two map toggles every session (it only ever sets them at
+            // runtime), so their last state is remembered here and put back once the world is open.
+            MtrOverlayToggles.tick();
             // The browser map's server, when the config asks for it to start itself: it waits for a
             // world to be loaded, because a page opened onto a 503 is worse than a socket opened a
             // moment later.
@@ -151,6 +176,9 @@ public final class HowToGo {
         // RoadEditHandler.
         RoadEditHandler.registerKeys();
         RoadEditHandler.registerScreenHandlers();
+        // The MTR sync's client half: the payload types and receiver. The hello is sent later, from
+        // the client tick, so that it can wait for a world -- see MtrClientSync.
+        MtrSync.onClientInit();
         // The map's switches: a screen overlay rather than part of the map, so that nothing the map
         // draws can end up over them. See MapFilterOverlay.
         MapFilterOverlay.register();
@@ -162,6 +190,10 @@ public final class HowToGo {
         // Registration into Xaero's render pipeline has to wait until Xaero has built its
         // handler, so we poll from the client tick instead of doing it here.
         HowToGoTicks.onClientTick(RoadLayer::onClientTick);
+        // The display mode's own tick job: it polls Xaero's Minimap for the overlay's registration
+        // and writes the one log line that says which mode is in force and, when the answer is not
+        // what the player asked for, why. See NavMapMode.
+        HowToGoTicks.onClientTick(NavMapMode::onClientTick);
         // The addon API's two tick jobs, and in this order: the deferred queue is drained before the
         // registration event is posted, so work queued by a registration handler waits for the next
         // tick and ClientScheduler's promise -- "the tick after the one that queued it" -- holds for
@@ -169,6 +201,9 @@ public final class HowToGo {
         HowToGoTicks.onClientTick(ClientScheduler::tick);
         HowToGoTicks.onClientTick(ApiBootstrap::fireOnce);
         HowToGoTicks.onClientTick(RoadStore::tick);
+        // After the roads, for the same reason as the Fabric arm: the details' "unlinked" reading
+        // asks the road network which of the player's own places still exist. See PlaceDetailStore.
+        HowToGoTicks.onClientTick(PlaceDetailStore::tick);
         HowToGoTicks.onClientTick(TransitLineStore::tick);
         HowToGoTicks.onClientTick(RailTrackStore::tick);
         // RoadWeaver's roads: read from its client map snapshot, or from its own road store while the
@@ -243,7 +278,6 @@ public final class HowToGo {
             Navigation.loadConfiguredMode();
             RoutePreferenceStore.load();
         });
-        ModItems.register(modEventBus);
         HowToGoConfig.registerClient(modContainer);
 
         LOGGER.info("[HowToGo] constructed");

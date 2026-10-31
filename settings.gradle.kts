@@ -3,9 +3,15 @@
 // they all compile the SAME shared source in src/ -- the per-version differences live in
 // `//?` comments inside that source (see stonecutter.gradle.kts) instead of in N git branches.
 //
-//   ./gradlew build                      builds the ACTIVE node only (fast, what you edit)
+//   ./gradlew :1.21.1-neoforge:build     builds ONE node (the active one is the state src/ holds)
+//   ./gradlew build                      builds EVERY node (a bare task name runs in every project)
 //   ./gradlew "Set active project to X"  switches the active node and rewrites src/ to its state
-//   ./gradlew chiseledBuild              builds every node (what CI runs)
+//
+// For one node, name it. Gradle executes an unqualified task name in EVERY project that has it,
+// so a bare `./gradlew runClient` starts a client for every node at once, most of them against an
+// empty per-node run/ directory, which is a mod-loading crash. `build` is the deliberate
+// exception: all twenty-one nodes is what `build` means here, and Stonecutter 0.7 has no separate
+// chiseled task for it.
 //
 // Why nodes are named "<version>-<loader>": the loader is part of the name but NOT of the
 // logical version, so `//? if >=26.1` still evaluates against 26.1 for the 26.1-neoforge node.
@@ -34,6 +40,12 @@ pluginManagement {
 
     repositories {
         mavenCentral()
+        // Plugin artifacts are served from plugins-artifacts.gradle.org after a redirect from
+        // plugins.gradle.org, and that host is unreachable from this network -- a clean checkout
+        // fails on Stonecutter's own jar here, not just on this project. Aliyun mirrors the Gradle
+        // Plugin Portal, jars included, so it is asked before the portal; the portal stays as the
+        // fallback for anything the mirror has not picked up yet.
+        maven("https://maven.aliyun.com/repository/gradle-plugin") { name = "AliyunGradlePlugin" }
         gradlePluginPortal()
         // Fabric Loom. On Fabric's own Maven, not the plugin portal.
         maven("https://maven.fabricmc.net/") { name = "Fabric" }
@@ -42,9 +54,10 @@ pluginManagement {
         // Stonecutter itself. Not on Maven Central -- this is its home repository.
         maven("https://maven.kikugie.dev/releases") { name = "KikuGie Releases" }
         maven("https://maven.kikugie.dev/snapshots") { name = "KikuGie Snapshots" }
-        // moddev / NeoForge. maven.neoforged.net is unreachable from this network; bmclapi
-        // proxies most of it and the workspace mirror carries the rest (see the root build).
-        maven("https://neoforged.forgecdn.net/releases") { name = "NeoForged CDN" }
+        // bmclapi used to stand here, proxying the NeoForged Maven (which is unreachable directly
+        // from this network) and Maven Central. It answers 403 now, so it is gone: the NeoForged
+        // half comes from its CDN in the per-node build script, and Maven Central is mavenCentral()
+        // above plus the Aliyun mirror the same script uses.
         maven {
             name = "workspaceLocalMirror"
             url = uri(providers.gradleProperty("htgLocalMaven").getOrElse("${rootDir}/.recon/maven-local"))
@@ -54,7 +67,8 @@ pluginManagement {
 
 plugins {
     id("dev.kikugie.stonecutter") version "0.7.11"
-    // Lets Gradle find the Zulu JDKs under D:\java, which auto-detection misses.
+    // Allows Gradle to resolve missing toolchains via Foojay. If the required JDKs are already
+    // installed outside Gradle's search path, pass -Porg.gradle.java.installations.paths=...
     id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
 }
 
@@ -88,10 +102,8 @@ stonecutter {
         neoforge("26.2")
         neoforge("26.3")
 
-        // Fabric is registered one node at a time as its loader glue lands, because a fabric node
-        // whose source has no `//? if fabric` branches yet does not compile and would take
-        // chiseledBuild down with it. The rest of the list is the same eleven versions the
-        // NeoForge half covers plus the three older ones.
+        // Fabric is registered for every node whose loader glue is present, including the 26.x
+        // nodes. Those require the Gradle JVM itself to be Java 25; see the toolchain note below.
         fabric("1.20.1")
         fabric("1.20.4")
         fabric("1.20.6")
@@ -121,18 +133,16 @@ stonecutter {
         // workaroundable from here: a corrected POM in the workspace mirror plus a repository
         // content filter so the good one is consulted first.
 
-        // 26.x Fabric is NOT registered. Two walls, in order:
+        // 26.x Fabric IS registered above. Two constraints shaped the setup:
         //
         //  1. Loom requires the Gradle JVM itself to be the Java the Minecraft version needs
         //     ("Minecraft 26.1 requires Java 25 but Gradle is using 21"), which is why the tree
-        //     is on Gradle 9.5.1 with Java 25 rather than 8.14.6. Gradle 9 is fine for
-        //     everything this tree needs.
-        //  2. Mojang publishes NO client_mappings or server_mappings for 26.1.2, 26.2 or 26.3
-        //     -- both keys are absent from the version JSON. Loom's officialMojangMappings()
-        //     has nothing to fetch, so a Fabric node cannot be given Mojang names at all.
+        //     is on Gradle 9.5.1 with Java 25 rather than 8.14.6.
+        //  2. Mojang publishes NO client_mappings or server_mappings for 26.1.2, 26.2 or 26.3.
+        //     The identity mapping and corrected intermediary POM described above handle that.
         //
         // NeoForge is unaffected because ModDevGradle takes its names from the NeoForge
-        // artifact, which carries them. Their gradle.properties are in place.
+        // artifact, which carries them.
 
 
         // The newest supported version. VCS-facing: it is the state src/ is kept in, so what

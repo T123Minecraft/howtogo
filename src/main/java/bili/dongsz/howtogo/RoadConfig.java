@@ -16,6 +16,9 @@
 /*
 package bili.dongsz.howtogo;
 
+import bili.dongsz.howtogo.client.HudAnchor;
+import bili.dongsz.howtogo.client.MapDisplayMode;
+import bili.dongsz.howtogo.client.UiTheme;
 import bili.dongsz.howtogo.road.ColorHex;
 import bili.dongsz.howtogo.road.RoadClass;
 import bili.dongsz.howtogo.route.RoutePreference;
@@ -24,6 +27,7 @@ import bili.dongsz.howtogo.route.TravelMode;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.annotations.SerializedName;
+import bili.dongsz.howtogo.client.Navigation;
 import net.fabricmc.loader.api.FabricLoader;
 
 import java.io.IOException;
@@ -88,6 +92,31 @@ public final class RoadConfig {
         @SerializedName("default_travel_mode")
         public String defaultTravelMode = TravelMode.WALK.id();
 
+        // Which style this mod's interfaces are drawn in. Fourth in the file on purpose, mirroring
+        // the row it takes on the NeoForge config screen: near the top, past the tuning values and
+        // before the routing switches, rather than buried at the end. The spelling is the id rather
+        // than the enum name because this arm is hand-edited JSON; see UiTheme.Mode.
+        @SerializedName("ui_theme")
+        public String uiTheme = UiTheme.Mode.AUTO.id();
+
+        // Where the map half of navigation is drawn: the navigation panel's own mini-map, or Xaero's
+        // Minimap with only the readout left in this mod's HUD. An id rather than the enum name, for
+        // the same reason as ui_theme above: this arm is a hand-edited JSON file. See MapDisplayMode.
+        @SerializedName("map_display_mode")
+        public String mapDisplayMode = MapDisplayMode.defaultMode().id();
+
+        // The corner the small readout-only card hangs from, and how far inside it to sit. Only the
+        // compact card has a corner to choose: the full panel is a fixed top-right card, while the
+        // compact one shares the screen with Xaero's Minimap, whose own default is the top-left.
+        @SerializedName("compact_hud_anchor")
+        public String compactHudAnchor = HudAnchor.defaultAnchor().id();
+
+        @SerializedName("compact_hud_offset_x")
+        public int compactHudOffsetX;
+
+        @SerializedName("compact_hud_offset_y")
+        public int compactHudOffsetY;
+
         @SerializedName("route_preference")
         public String routePreference = RoutePreference.FASTEST_TIME.id();
 
@@ -132,6 +161,9 @@ public final class RoadConfig {
 
         @SerializedName("mtr_map_overlay")
         public boolean mtrMapOverlay = true;
+
+        @SerializedName("mtr_server_sync")
+        public boolean mtrServerSync = true;
 
         @SerializedName("mtr_station_merge_blocks")
         public int mtrStationMergeBlocks = 256;
@@ -188,6 +220,15 @@ public final class RoadConfig {
             }
             if (defaultTravelMode == null) {
                 defaultTravelMode = TravelMode.WALK.id();
+            }
+            if (uiTheme == null) {
+                uiTheme = UiTheme.Mode.AUTO.id();
+            }
+            if (mapDisplayMode == null) {
+                mapDisplayMode = MapDisplayMode.defaultMode().id();
+            }
+            if (compactHudAnchor == null) {
+                compactHudAnchor = HudAnchor.defaultAnchor().id();
             }
             if (routePreference == null) {
                 routePreference = RoutePreference.FASTEST_TIME.id();
@@ -263,6 +304,112 @@ public final class RoadConfig {
         } catch (IOException failed) {
             HowToGo.LOGGER.error("[HowToGo] could not write {}", path, failed);
         }
+    }
+
+    // --------------------------------------------------- writing (in-game settings)
+    //
+    // The settings screen writes through these instead of through {@link Values}: one named method
+    // per key is the same surface the NeoForge arm offers, so the screen is written once and knows
+    // nothing about the two storage shapes. A setter only writes the value in memory. The screen
+    // calls {@link #save()} after it, which persists it, and {@link #applyRuntimeChanges()}, which
+    // re-reads the few keys the mod latches rather than reads where it uses them.
+    //
+    // Range checks live here rather than in the screen because the JSON arm has no validator of its
+    // own: an out-of-range number in the file is accepted and only the NeoForge arm's spec would
+    // correct it on the next load, so both arms clamp at the one door a value is written through.
+
+// The interface theme; the two loader arms store the id and the constant respectively.
+    public static void setUiTheme(UiTheme.Mode mode) {
+        values.uiTheme = (mode == null ? UiTheme.Mode.AUTO : mode).id();
+    }
+
+// Where the map half of navigation is drawn.
+    public static void setMapDisplayMode(MapDisplayMode mode) {
+        values.mapDisplayMode = (mode == null ? MapDisplayMode.defaultMode() : mode).id();
+    }
+
+// The compact HUD card's corner, and how far inside that corner it sits.
+    public static void setCompactHudAnchor(HudAnchor anchor) {
+        values.compactHudAnchor = (anchor == null ? HudAnchor.defaultAnchor() : anchor).id();
+    }
+
+    public static void setCompactHudOffsetX(int pixels) {
+        values.compactHudOffsetX = clamp(pixels, -200, 200);
+    }
+
+    public static void setCompactHudOffsetY(int pixels) {
+        values.compactHudOffsetY = clamp(pixels, -200, 200);
+    }
+
+// The travel mode navigation starts in.
+    public static void setDefaultTravelMode(TravelMode mode) {
+        values.defaultTravelMode = (mode == null ? TravelMode.WALK : mode).id();
+    }
+
+// Whether a slower-than-walking trip is replanned on foot.
+    public static void setFallBackToWalkingWhenSlower(boolean on) {
+        values.fallBackToWalkingWhenSlower = on;
+    }
+
+// How far a walking trip may leave the network, in blocks.
+    public static void setWalkOffroadBlocks(double blocks) {
+        values.walkOffroadBlocks = clamp(blocks, 0.0, 4096.0);
+    }
+
+// How close to a stop of the journey counts as being at that stop, in blocks.
+    public static void setStationSnapBlocks(double blocks) {
+        values.stationSnapBlocks = clamp(blocks, 1.0, 256.0);
+    }
+
+// Seconds of waiting one boarding of a service costs.
+    public static void setTransitWaitSeconds(double seconds) {
+        values.transitWaitSeconds = clamp(seconds, 0.0, 3600.0);
+    }
+
+// The read-only map layers and where the browser map's server starts.
+    public static void setCreateTrainTracks(boolean on) {
+        values.createTrainTracks = on;
+    }
+
+    public static void setMtrTransit(boolean on) {
+        values.mtrTransit = on;
+    }
+
+    public static void setMtrFullMap(boolean on) {
+        values.mtrFullMap = on;
+    }
+
+    public static void setRoadWeaverRoads(boolean on) {
+        values.roadWeaverRoads = on;
+    }
+
+    public static void setWebMapAutoStart(boolean on) {
+        values.webmapAutoStart = on;
+    }
+
+//
+// * Applies the keys the mod holds rather than reads where it uses them.
+// *
+// * <p>This arm has no loader config service and so no reload event: the default travel mode is
+// * latched in {@link Navigation}, so a saved change to it would otherwise wait for the next game
+// * launch. NeoForge's arm has the same method, but there {@link #save()} fires
+// * {@code ModConfigEvent.Reloading} itself and the listener in {@code HowToGo} already does this
+// * work.
+// *
+// * <p>The other key the NeoForge listener invalidates -- RoadWeaver's road class -- is not one of
+// * the keys this screen exposes, and the Fabric arm does not tick that layer at all yet, so there is
+// * nothing here to invalidate.
+//
+    public static void applyRuntimeChanges() {
+        Navigation.reloadConfiguredMode();
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private static double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     private RoadConfig() {
@@ -406,6 +553,47 @@ public final class RoadConfig {
     }
 
 // 
+// * The interface theme in force, or the declared default before the config has been read.
+// *
+// * <p>The file holds the id ("auto", "light", "dark"), so an id that names no mode -- a typo, or
+// * a value written by a newer version -- costs the player the default rather than the whole file.
+// * The default is auto: the white style in daylight and the black one at night, which is the
+// * answer that needs no configuration to make sense.
+// 
+    public static UiTheme.Mode uiTheme() {
+        UiTheme.Mode mode = UiTheme.Mode.byId(values.uiTheme);
+        return mode == null ? UiTheme.Mode.AUTO : mode;
+    }
+
+// 
+// * Where the map half of navigation is drawn, or the declared default before the file has been read.
+// *
+// * <p>An id read through {@link MapDisplayMode#byId}, so an entry that names no mode -- a typo, or a
+// * value a newer version wrote -- costs the player the default rather than the whole file. The
+// * declared default is the mod's own panel, which is the behaviour every existing player has.
+// 
+    public static MapDisplayMode mapDisplayMode() {
+        MapDisplayMode mode = MapDisplayMode.byId(values.mapDisplayMode);
+        return mode == null ? MapDisplayMode.defaultMode() : mode;
+    }
+
+// The corner the readout-only card hangs from, defaulting to the bottom-left before the file loads.
+    public static HudAnchor compactHudAnchor() {
+        HudAnchor anchor = HudAnchor.byId(values.compactHudAnchor);
+        return anchor == null ? HudAnchor.defaultAnchor() : anchor;
+    }
+
+// The horizontal offset inside that corner, in pixels; see {@link #compactHudAnchor()}.
+    public static int compactHudOffsetX() {
+        return values.compactHudOffsetX;
+    }
+
+// The vertical offset inside that corner, in pixels; see {@link #compactHudAnchor()}.
+    public static int compactHudOffsetY() {
+        return values.compactHudOffsetY;
+    }
+
+// 
 // * The routing policy in force, read in one go.
 // *
 // * <p>One read rather than three at each use, so a single plan cannot be costed half by the old
@@ -461,6 +649,11 @@ public final class RoadConfig {
 // Whether the whole railway MTR Map Overlay fetched is read, on before the config loads. 
     public static boolean mtrMapOverlay() {
         return values.mtrMapOverlay;
+    }
+
+// Whether the server's own reading of MTR is asked for and used, on before the config loads. 
+    public static boolean mtrServerSync() {
+        return values.mtrServerSync;
     }
 
 // 
@@ -594,6 +787,9 @@ public final class RoadConfig {
 //? if neoforge {
 package bili.dongsz.howtogo;
 
+import bili.dongsz.howtogo.client.HudAnchor;
+import bili.dongsz.howtogo.client.MapDisplayMode;
+import bili.dongsz.howtogo.client.UiTheme;
 import bili.dongsz.howtogo.road.ColorHex;
 import bili.dongsz.howtogo.road.RoadClass;
 import bili.dongsz.howtogo.route.RoutePreference;
@@ -729,6 +925,23 @@ public final class RoadConfig {
     private record ParsedColor(String text, int argb) {
     }
 
+    /** The interface theme; see {@link #uiTheme()} and {@code UiTheme}. */
+    private static final ModConfigSpec.EnumValue<UiTheme.Mode> UI_THEME;
+    /**
+     * Where the map half of navigation is drawn: this mod's own panel, or Xaero's Minimap.
+     *
+     * <p>See {@link #mapDisplayMode()} for the fallback rule and {@link MapDisplayMode} for what the
+     * two answers mean. Declared as an enum rather than a string so the config screen offers the two
+     * as a cycling button -- there is no spelling to get wrong, and the file then holds the constant
+     * name, which the enum's own reader accepts in any case.
+     */
+    private static final ModConfigSpec.EnumValue<MapDisplayMode> MAP_DISPLAY_MODE;
+    /** The corner the readout-only card hangs from; see {@link #compactHudAnchor()}. */
+    private static final ModConfigSpec.EnumValue<HudAnchor> COMPACT_HUD_ANCHOR;
+    /** How far inside that corner it sits, in pixels; see {@link #compactHudOffsetX()}. */
+    private static final ModConfigSpec.IntValue COMPACT_HUD_OFFSET_X;
+    /** The same, vertically; see {@link #compactHudOffsetY()}. */
+    private static final ModConfigSpec.IntValue COMPACT_HUD_OFFSET_Y;
     private static final ModConfigSpec.ConfigValue<String> DEFAULT_TRAVEL_MODE;
     private static final ModConfigSpec.ConfigValue<String> ROUTE_PREFERENCE;
     private static final ModConfigSpec.ConfigValue<List<? extends String>> AVOID_ROAD_CLASSES;
@@ -757,6 +970,7 @@ public final class RoadConfig {
     private static final ModConfigSpec.BooleanValue MTR_TRANSIT;
     private static final ModConfigSpec.BooleanValue MTR_FULL_MAP;
     private static final ModConfigSpec.BooleanValue MTR_MAP_OVERLAY;
+    private static final ModConfigSpec.BooleanValue MTR_SERVER_SYNC;
     private static final ModConfigSpec.IntValue MTR_STATION_MERGE_BLOCKS;
     private static final ModConfigSpec.BooleanValue MTR_AUTO_ROUTE_MARKS;
     private static final ModConfigSpec.BooleanValue ROADWEAVER_ROADS;
@@ -813,6 +1027,93 @@ public final class RoadConfig {
                     .defineInRange(key, defaultTolerance(roadClass), 1.0, 128.0));
         }
         builder.pop();
+
+        // Fourth in the file, deliberately: after the three lists a player tunes once and before
+        // the routing switches, so it is one of the first rows the config screen shows rather than
+        // something to go looking for. It is a display setting and it sits with the colours.
+        //
+        // An enum rather than a string so the config screen offers the three answers as a button
+        // that cycles through them, instead of a text box in which "auto" has to be typed and a
+        // typo turns the entry red. The file then holds the constant name, which the enum's own
+        // reader accepts in any case; the Fabric arm's JSON holds the id instead, because that file
+        // is written in the spellings a player edits by hand.
+        UI_THEME = builder.comment(
+                        "Which style this mod's interfaces are drawn in.",
+                        "",
+                        "\"dark\" is the black style the mod has always had. \"light\" is the white one:",
+                        "white sheets, near-black text and the blue of Google Maps for anything that can",
+                        "be acted on, which keeps the same simple, flat, text-and-hairline look the dark",
+                        "style has.",
+                        "",
+                        "\"auto\" -- the default -- follows the world: the white style while the sky is",
+                        "bright and the black one once it is dark, and always the black one in the",
+                        "Nether, the End and any other dimension that declares no sky. It asks the game",
+                        "for the same sky-brightness value the sky itself is shaded by, so it turns over",
+                        "when the sun does, and a thunderstorm darkens the interface along with the",
+                        "world.",
+                        "",
+                        "This is a client setting: nothing here is sent to a server and nothing in the",
+                        "world changes. A change takes effect on the next frame drawn, in every screen",
+                        "this mod opens -- including the navigation panel and the destination page on",
+                        "MCphone -- so there is no restart and no need to reload the world.")
+                .translation("howtogo.configuration.ui_theme")
+                .defineEnum("ui_theme", UiTheme.Mode.AUTO);
+
+        MAP_DISPLAY_MODE = builder.comment(
+                        "Where the map half of navigation is drawn.",
+                        "",
+                        "\"hud\" -- the default -- draws it in this mod's own navigation panel: a card",
+                        "in the corner of the screen holding a small rotating map with the roads, the",
+                        "route, the turn markers and the destination on it, and the trip readout under",
+                        "it. This is the panel the mod has always had, and it works with nothing else",
+                        "installed.",
+                        "",
+                        "\"xaero_minimap\" draws the map half on Xaero's Minimap instead: the route, the",
+                        "turn markers and the destination are drawn over its map, and this mod's HUD",
+                        "keeps only a small card carrying what a map cannot show -- the turn arrow, the",
+                        "distance to the turn, what is left of the trip and the progress bar.",
+                        "",
+                        "The second answer needs Xaero's Minimap (id \"xaerominimap\") installed and",
+                        "this build compiled against it. If either is missing, or if registering with",
+                        "it fails, the first answer is used instead and one line in the log says what",
+                        "was missing -- so a player who selects it and sees the panel keep its map can",
+                        "find out why.",
+                        "",
+                        "This is a client setting: nothing here is sent to a server and nothing in the",
+                        "world changes. On NeoForge a change takes effect on the next frame; the Fabric",
+                        "file is read at startup, as every value in it is.")
+                .translation("howtogo.configuration.map_display_mode")
+                .defineEnum("map_display_mode", MapDisplayMode.defaultMode());
+
+        COMPACT_HUD_ANCHOR = builder.comment(
+                        "Which corner the small readout-only card hangs from, in the",
+                        "xaero_minimap display mode.",
+                        "",
+                        "The default is \"bottom_left\": Xaero's Minimap's own default corner is the",
+                        "top-left, so putting the card at the bottom of the screen keeps the two off",
+                        "each other, and the bottom edge is out of the way of everything at eye level.",
+                        "A player whose chat history is long, or who has moved Xaero's Minimap to that",
+                        "corner, can move the card with this and the two offsets below.",
+                        "",
+                        "The two offsets below move the card further in from its corner, in pixels at",
+                        "the current GUI scale. Leaving them at zero keeps it at the standard margin,",
+                        "which is what most installs want.")
+                .translation("howtogo.configuration.compact_hud_anchor")
+                .defineEnum("compact_hud_anchor", HudAnchor.defaultAnchor());
+
+        COMPACT_HUD_OFFSET_X = builder.comment(
+                        "How far the small readout card sits from its corner's edge, in pixels.",
+                        "Zero is the standard screen margin. Positive values move it further from",
+                        "that edge, into the screen. See compact_hud_anchor for which corner.")
+                .translation("howtogo.configuration.compact_hud_offset_x")
+                .defineInRange("compact_hud_offset_x", 0, -200, 200);
+
+        COMPACT_HUD_OFFSET_Y = builder.comment(
+                        "How far the small readout card sits from its corner's top or bottom edge,",
+                        "in pixels. Zero is the standard screen margin; positive values move it",
+                        "further from that edge, into the screen. See compact_hud_anchor.")
+                .translation("howtogo.configuration.compact_hud_offset_y")
+                .defineInRange("compact_hud_offset_y", 0, -200, 200);
 
         STATION_SNAP_BLOCKS = builder.comment(
                         "How close to a stop of the journey still counts as being at that stop, in",
@@ -1003,23 +1304,42 @@ public final class RoadConfig {
 
         MTR_MAP_OVERLAY = builder.comment(
                         "Whether the whole railway MTR Map Overlay has fetched from the server is read",
-                        "and offered as this mod's own. That mod (id \"mtrmap\") asks the server for a",
-                        "snapshot of every line, station and rail of MTR's network and keeps it on the",
-                        "client, so with it installed -- and with it installed on the server too, which",
-                        "is what the snapshot needs -- the whole railway is known here whatever the",
-                        "player is connected to. mtr_full_map can only reach the copy of the network",
-                        "this process happens to be simulating, which is nothing at all on somebody",
-                        "else's server; this is the answer for that case, and the two are independent.",
-                        "It is also the only reading that says which rails each line runs along, so it",
-                        "is the only one that draws a line along its railway rather than between its",
-                        "stations -- and a line drawn from it is drawn that way across the whole",
-                        "network, not only where the player has been.",
+                        "as a fallback and offered as this mod's own. That mod (id \"mtrmap\") asks the",
+                        "server for a snapshot of every line, station and rail of MTR's network and keeps",
+                        "it on the client, so with it installed -- and with it installed on the server",
+                        "too, which is what the snapshot needs -- the whole railway is known here whatever",
+                        "the player is connected to.",
+                        "It is read only when this mod has no fuller reading of its own: the railway the",
+                        "server sent (mtr_server_sync, which needs this mod on the server) or the one this",
+                        "process is simulating (mtr_full_map, single player). Those are taken from the",
+                        "simulation itself rather than from another mod's snapshot of it, so they win",
+                        "whenever they exist -- and when they do, this reading is not taken at all, so the",
+                        "same stations cannot be offered twice through two readers that disagree.",
+                        "It is also the only reading that says which rails each line runs along, so as a",
+                        "fallback it is the one that draws a line along its railway rather than between",
+                        "its stations, and across the whole network rather than only where the player has",
+                        "been.",
                         "Read reflectively, so with the mod absent nothing here does anything at all and",
                         "no dependency is needed in either direction; a server that does not have it",
-                        "leaves the client's own copy of the mod with nothing but the radius-limited",
-                        "data MTR already sends, which this ignores rather than reads twice.")
+                        "leaves the client with nothing but the radius-limited data MTR already sends,",
+                        "which this ignores rather than reads twice.")
                 .translation("howtogo.configuration.mtr_map_overlay")
                 .define("mtr_map_overlay", true);
+
+        MTR_SERVER_SYNC = builder.comment(
+                        "Whether the server's own reading of MTR is asked for and used. On, the client",
+                        "says hello when it joins, and a server running this mod answers with the whole",
+                        "railway it is simulating -- every station, line and rail of every dimension, read",
+                        "on MTR's own thread and sent in parts. It is preferred over MTR Map Overlay's",
+                        "snapshot, which is then not read at all, and over MTR's own radius-limited window.",
+                        "Off, the client asks for nothing and behaves exactly as it did before this sync",
+                        "existed. The server has no switch: it only ever answers a client that asked, and",
+                        "a client that has not asked is sent nothing.",
+                        "This is a client setting -- it decides what this client asks for. A server with",
+                        "this mod sends nothing to a client without it, and a client with this mod asks",
+                        "nothing of a server without it.")
+                .translation("howtogo.configuration.mtr_server_sync")
+                .define("mtr_server_sync", true);
 
         MTR_STATION_MERGE_BLOCKS = builder.comment(
                         "How far apart two of MTR's stations may be and still be one station here,",
@@ -1412,6 +1732,70 @@ public final class RoadConfig {
     }
 
     /**
+     * The interface theme in force, or the declared default before the config has been read.
+     *
+     * <p>One read, in one place, so every screen asks the same question and gets the same answer:
+     * the alternative is each screen reading the spec for itself, and two screens disagreeing for
+     * the frame between them. Read through {@code UiTheme}, which turns this mode plus the world's
+     * sky brightness into the pair of palettes its colours come from.
+     *
+     * <p>The declared default is {@link UiTheme.Mode#AUTO} rather than the black style: white by
+     * day and black by night is what a player would design for themselves, and it is the only one
+     * of the three that never looks out of place.
+     */
+    public static UiTheme.Mode uiTheme() {
+        try {
+            return UI_THEME.get();
+        } catch (IllegalStateException notLoadedYet) {
+            return UiTheme.Mode.AUTO;
+        }
+    }
+
+    /**
+     * Where the map half of navigation is drawn, or the declared default before the config is read.
+     *
+     * <p>The declared default is {@link MapDisplayMode#HUD}: the panel that draws its own map is the
+     * behaviour every existing player has, and it is the one mode that cannot be defeated by another
+     * mod being missing. What the other answer means when it cannot be honoured is not decided here --
+     * this method reports what the player asked for, and {@code NavMapMode} decides what is possible
+     * and writes the fallback line when the two differ.
+     */
+    public static MapDisplayMode mapDisplayMode() {
+        try {
+            return MAP_DISPLAY_MODE.get();
+        } catch (IllegalStateException notLoadedYet) {
+            return MapDisplayMode.defaultMode();
+        }
+    }
+
+    /** Which corner the readout-only card hangs from, or the declared default before the config loads. */
+    public static HudAnchor compactHudAnchor() {
+        try {
+            return COMPACT_HUD_ANCHOR.get();
+        } catch (IllegalStateException notLoadedYet) {
+            return HudAnchor.defaultAnchor();
+        }
+    }
+
+    /** How far inside that corner's horizontal edge the card sits, in pixels. */
+    public static int compactHudOffsetX() {
+        try {
+            return COMPACT_HUD_OFFSET_X.get();
+        } catch (IllegalStateException notLoadedYet) {
+            return 0;
+        }
+    }
+
+    /** How far inside that corner's vertical edge the card sits, in pixels. */
+    public static int compactHudOffsetY() {
+        try {
+            return COMPACT_HUD_OFFSET_Y.get();
+        } catch (IllegalStateException notLoadedYet) {
+            return 0;
+        }
+    }
+
+    /**
      * The routing policy in force, read in one go.
      *
      * <p>One read rather than three at each use, so a single plan cannot be costed half by the old
@@ -1494,6 +1878,23 @@ public final class RoadConfig {
     public static boolean mtrMapOverlay() {
         try {
             return MTR_MAP_OVERLAY.get();
+        } catch (IllegalStateException notLoadedYet) {
+            return true;
+        }
+    }
+
+    /**
+     * Whether the server's own reading of MTR is asked for and used.
+     *
+     * <p>On, the client says hello when it joins and offers whatever the server sends as its own full
+     * reading -- preferred over MTR Map Overlay's snapshot, which is then not read at all. Off, the
+     * client asks for nothing and behaves exactly as it did before the sync existed. The server side
+     * has no switch: it only ever answers a client that asked, and a client that has not asked is sent
+     * nothing.
+     */
+    public static boolean mtrServerSync() {
+        try {
+            return MTR_SERVER_SYNC.get();
         } catch (IllegalStateException notLoadedYet) {
             return true;
         }
@@ -1601,6 +2002,126 @@ public final class RoadConfig {
         } catch (IllegalStateException notLoadedYet) {
             return false;
         }
+    }
+
+    // --------------------------------------------------- writing (in-game settings)
+    //
+    // The settings screen writes through these instead of through the spec: one named method per
+    // key keeps the two loader arms on one surface, and every range check the spec declares is
+    // repeated here because {@code ConfigValue#set} writes straight into the loaded config and does
+    // not run the value's predicate.
+    //
+    // A setter only writes the value. The screen calls {@link #save()} after it, which persists the
+    // file and -- through {@code ModConfigSpec#save()} -- fires {@code ModConfigEvent.Reloading}.
+    // That event is already handled in HowToGo: it re-reads the default travel mode and invalidates
+    // RoadWeaver's layer, which is what {@link #applyRuntimeChanges()} exists for on the JSON arm.
+
+// The interface theme.
+    public static void setUiTheme(UiTheme.Mode mode) {
+        write(UI_THEME, mode == null ? UiTheme.Mode.AUTO : mode);
+    }
+
+// Where the map half of navigation is drawn.
+    public static void setMapDisplayMode(MapDisplayMode mode) {
+        write(MAP_DISPLAY_MODE, mode == null ? MapDisplayMode.defaultMode() : mode);
+    }
+
+// The compact HUD card's corner, and how far inside that corner it sits.
+    public static void setCompactHudAnchor(HudAnchor anchor) {
+        write(COMPACT_HUD_ANCHOR, anchor == null ? HudAnchor.defaultAnchor() : anchor);
+    }
+
+    public static void setCompactHudOffsetX(int pixels) {
+        write(COMPACT_HUD_OFFSET_X, clamp(pixels, -200, 200));
+    }
+
+    public static void setCompactHudOffsetY(int pixels) {
+        write(COMPACT_HUD_OFFSET_Y, clamp(pixels, -200, 200));
+    }
+
+// The travel mode navigation starts in, written as the id both arms agree on.
+    public static void setDefaultTravelMode(TravelMode mode) {
+        write(DEFAULT_TRAVEL_MODE, (mode == null ? TravelMode.WALK : mode).id());
+    }
+
+// Whether a slower-than-walking trip is replanned on foot.
+    public static void setFallBackToWalkingWhenSlower(boolean on) {
+        write(FALL_BACK_TO_WALKING_WHEN_SLOWER, on);
+    }
+
+// How far a walking trip may leave the network, in blocks.
+    public static void setWalkOffroadBlocks(double blocks) {
+        write(WALK_OFFROAD_BLOCKS, clamp(blocks, 0.0, 4096.0));
+    }
+
+// How close to a stop of the journey counts as being at that stop, in blocks.
+    public static void setStationSnapBlocks(double blocks) {
+        write(STATION_SNAP_BLOCKS, clamp(blocks, 1.0, 256.0));
+    }
+
+// Seconds of waiting one boarding of a service costs.
+    public static void setTransitWaitSeconds(double seconds) {
+        write(TRANSIT_WAIT_SECONDS, clamp(seconds, 0.0, 3600.0));
+    }
+
+// The read-only map layers and where the browser map's server starts.
+    public static void setCreateTrainTracks(boolean on) {
+        write(CREATE_TRAIN_TRACKS, on);
+    }
+
+    public static void setMtrTransit(boolean on) {
+        write(MTR_TRANSIT, on);
+    }
+
+    public static void setMtrFullMap(boolean on) {
+        write(MTR_FULL_MAP, on);
+    }
+
+    public static void setRoadWeaverRoads(boolean on) {
+        write(ROADWEAVER_ROADS, on);
+    }
+
+    public static void setWebMapAutoStart(boolean on) {
+        write(WEBMAP_AUTO_START, on);
+    }
+
+    /**
+     * Writes one value, and does nothing at all before the file has been read.
+     *
+     * <p>{@code ConfigValue#set} assumes a loaded config and throws if there is none -- the same
+     * state {@link #save()} guards against -- so the guard lives here rather than in fifteen
+     * setters. Nothing in the mod can call these before client setup; the guard keeps that a
+     * property of this class rather than of every future caller.
+     */
+    private static <T> void write(ModConfigSpec.ConfigValue<T> entry, T value) {
+        if (SPEC.isLoaded()) {
+            entry.set(value);
+        }
+    }
+
+    /** Writes the spec to disk and fires the reload event the rest of the mod listens for. */
+    public static void save() {
+        if (SPEC.isLoaded()) {
+            SPEC.save();
+        }
+    }
+
+    /**
+     * Kept for the one call site both arms share.
+     *
+     * <p>On this arm {@link #save()} already fires {@code ModConfigEvent.Reloading}, whose listener
+     * re-reads the latched travel mode and invalidates RoadWeaver's layer -- the two things the
+     * JSON arm has no event to do for it.
+     */
+    public static void applyRuntimeChanges() {
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private static double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
     }
 }
 //?}

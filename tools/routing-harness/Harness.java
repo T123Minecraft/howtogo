@@ -102,6 +102,9 @@ public final class Harness {
         int[] stroke = bili.dongsz.howtogo.client.StrokeOutlineCheck.run();
         checks += stroke[0];
         failures += stroke[1];
+        int[] ownMaps = bili.dongsz.howtogo.client.HudDrawCheck.run();
+        checks += ownMaps[0];
+        failures += ownMaps[1];
         int[] thinning = bili.dongsz.howtogo.client.PathThinningCheck.run();
         checks += thinning[0];
         failures += thinning[1];
@@ -111,6 +114,9 @@ public final class Harness {
         int[] turns = bili.dongsz.howtogo.client.TurnCursorCheck.run();
         checks += turns[0];
         failures += turns[1];
+        int[] surface = bili.dongsz.howtogo.client.ClassChangeCheck.run();
+        checks += surface[0];
+        failures += surface[1];
         int[] addonApi = bili.dongsz.howtogo.api.AddonApiCheck.run();
         checks += addonApi[0];
         failures += addonApi[1];
@@ -129,6 +135,9 @@ public final class Harness {
         int[] archives = bili.dongsz.howtogo.worlddata.WorldArchiveCheck.run();
         checks += archives[0];
         failures += archives[1];
+        int[] placeDetails = bili.dongsz.howtogo.place.PlaceDetailsCheck.run();
+        checks += placeDetails[0];
+        failures += placeDetails[1];
         int[] drawOrder = DrawOrderCheck.run();
         checks += drawOrder[0];
         failures += drawOrder[1];

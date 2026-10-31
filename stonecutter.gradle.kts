@@ -125,7 +125,7 @@ stonecutter parameters {
         // A rule rather than a condition because it is purely a spelling: same annotation, same id,
         // and the restriction it expressed did not exist to lose. The alternative was a version
         // condition on the class declaration, which sits inside the loader fence in HowToGo and
-        // HowToGoServer and would nest.
+        // would nest.
         regex(eval(current.version, "<1.20.5")) {
             // One replace per block -- the second call is rejected with "the value for property
             // 'fromPattern' cannot be changed any further" -- so the two dist values alternate.
@@ -332,11 +332,96 @@ stonecutter parameters {
                     "parent.extractRenderState(graphics, mouseX, mouseY, partialTick)")
             reverse("NO_REVERSE", "NO_REVERSE")
         }
+        // The ResourceLocation factory is a version question, not a receiver question: before 1.21
+        // the class is built with its public constructor and has no fromNamespaceAndPath; from 1.21
+        // the constructor is private and the factory is the only way in. ItemProperties' pre-1.21.2
+        // arm is one block serving Fabric nodes on both sides of that boundary, so the call is
+        // written through a placeholder and resolved here, per version. The token appears nowhere
+        // else in the tree.
+        regex(eval(current.version, "<1.21")) {
+            replace("HTG_RESOURCE_LOCATION", "new ResourceLocation")
+            reverse("NO_REVERSE", "NO_REVERSE")
+        }
+        regex(eval(current.version, ">=1.21")) {
+            replace("HTG_RESOURCE_LOCATION", "ResourceLocation.fromNamespaceAndPath")
+            reverse("NO_REVERSE", "NO_REVERSE")
+        }
         // The map's viewport question is NOT a rule here, and neither is its text call. Xaero's own
         // MapElementGraphics reports no size of its own and keeps drawString -- it is not the vanilla
         // type and did not follow it -- so the blanket .drawString( rule above must not reach it.
         // Both live behind conditions in RoadElementRenderer instead. The general lesson: a rename
         // rule cannot tell one receiver's method from another's, so it is only safe when every
         // receiver in the tree agrees. That is worth checking before writing one.
+    }
+}
+
+// One directory for everything that ships. A normal build leaves each jar under its own node's
+// build/libs; this builds every node and copies the results into dist/ under the release name the
+// repository already uses -- howtogo-<mod version>+mc<node>.jar. dist/ itself is git-ignored build
+// output (see .gitignore): the jars go to the GitHub release, not into a commit, and the local
+// dist/README.md describes what the directory holds.
+//
+// It is a root task, so it does NOT fan out: `./gradlew collectDist` runs once and is the only
+// thing that deletes or overwrites anything in dist/.
+val shippedVersion = providers.gradleProperty("mod_version").get()
+tasks.register<Copy>("collectDist") {
+    group = "distribution"
+    description = "Builds every node, collects all jars into dist/ under their release names, and drops the previous version's jars."
+    dependsOn(subprojects.map { "${it.path}:build" })
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    // Always run. Copy is incremental: when dist/ already holds byte-identical jars Gradle marks
+    // this UP-TO-DATE and rewrites nothing, which reads as "collect did not collect" -- the jar
+    // timestamps in dist/ stay old even though the files are the current build's.
+    outputs.upToDateWhen { false }
+    subprojects.forEach { node ->
+        from(node.layout.buildDirectory.dir("libs")) {
+            // Only this build's jars: a node's libs/ can also hold jars from an older mod version
+            // (an IDE build with a different Gradle user home writes its own mod_version), and those
+            // must not be renamed over the current release name.
+            include("*-$shippedVersion+*.jar")
+            exclude("*-sources.jar", "*-javadoc.jar")
+            rename { "howtogo-$shippedVersion+mc${node.name}.jar" }
+        }
+    }
+    into(layout.projectDirectory.dir("dist"))
+    doLast {
+        // dist/ holds this version's jars only -- dist/README.md says the previous version lives in
+        // its own release and in git history, and that the directory does not accumulate. A Copy
+        // task only adds and overwrites, though, so after a version bump a plain run left both
+        // versions side by side (the first 0.2.3 collect produced 21 new jars next to the 21 0.2.2
+        // ones). Enforce the contract here, and only on jars: dist/README.md and anything else the
+        // directory carries are not this task's to delete.
+        val distDir = layout.projectDirectory.dir("dist").asFile
+        val releasePrefix = "howtogo-$shippedVersion+mc"
+        val stale = distDir.listFiles { f ->
+            f.isFile && f.extension == "jar" && f.name.startsWith("howtogo-") &&
+                    !f.name.startsWith(releasePrefix)
+        }.orEmpty()
+        for (f in stale) {
+            if (f.delete()) {
+                logger.lifecycle("dist/: removed stale ${f.name}")
+            } else {
+                logger.warn("dist/: could not remove stale ${f.name}")
+            }
+        }
+        val jars = distDir.listFiles { f ->
+            f.extension == "jar" && f.name.startsWith(releasePrefix)
+        }
+        logger.lifecycle("dist/: ${jars?.size ?: 0} jars of $shippedVersion")
+    }
+}
+
+// Keep the IDE's indexing and search out of the two directories that are build state rather than
+// source: dist/ (release jars, regenerated by collectDist) and versions/ (Stonecutter's node
+// projects, each with a build/ tree holding a full copy of the sources). .idea/ is machine-local and
+// git-ignored, so "mark as excluded" clicked in the IDE survives only on that machine and only until
+// the next reimport; declaring it in the Gradle model is what makes every import start excluded.
+// apply(plugin = ...) rather than a plugins block: the root script's plugins block is Stonecutter's,
+// and the idea plugin only exists to carry this one setting.
+apply(plugin = "idea")
+
+configure<org.gradle.plugins.ide.idea.model.IdeaModel> {
+    module {
+        excludeDirs = excludeDirs + file("dist") + file("versions")
     }
 }

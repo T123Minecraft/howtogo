@@ -27,20 +27,35 @@ settings.gradle.kts                 the node tree
 Adding a mod loader later (Fabric) means a loader entry in `settings.gradle.kts`, a
 `build.fabric.gradle.kts`, and nodes named `<mc>-fabric`. The shared source does not move.
 
+### IntelliJ IDEA and the shared source
+
+Gradle exports every node's source directories to IntelliJ as content roots, and a directory
+declared by all twenty-one modules is de-duplicated down to one module by the IDE (its log says
+`Duplicating content roots detected`). That used to leave the active node -- the one the editor
+resolves source files against -- without `src/common/java`, so it showed unresolved symbols
+everywhere. The build scripts therefore hand the real `src/common/java` (and, on Fabric,
+`src/fabric/resources`) to the ACTIVE node only; every other node compiles a copy under its own
+`build/generated/`, which is unique per node and never de-duplicated. The sources and the jars are
+unchanged -- if the editor is stale after a switch, Reload All Gradle Projects.
+
 ## Commands
 
 ```powershell
-# The env vars are mandatory: JDK 21 runs Gradle, the 26.x nodes compile with the JDK 25
-# toolchain, and the workspace mirror is where the blocked-here NeoForge artifacts live.
-$env:JAVA_HOME = "D:\java\zulu21"
+# The env vars are mandatory: the Gradle JVM must be JDK 25 because the 26.x nodes require it,
+# while the 17/21 toolchains are selected per node. If those toolchains are not auto-detected,
+# pass -Porg.gradle.java.installations.paths=<jdk-17>,<jdk-21>,<jdk-25>.
+$env:JAVA_HOME = "<JDK 25>"
 $env:GRADLE_USER_HOME = "E:\Projects\Minecraft\Mods\howtogo\.gradle-home"
 $gradle = "E:\Projects\Minecraft\Mods\howtogo\.gradle-dist\gradle-9.7.1\bin\gradle.bat"
 $lm = "-PhtgLocalMaven=E:/Projects/Minecraft/Mods/howtogo/.recon/maven-local"
 
-& $gradle -p . $lm build                      # the ACTIVE node only -- what you work with
+& $gradle -p . $lm :1.21.1-neoforge:build     # one node -- the active one is what src/ holds
 & $gradle -p . $lm :26.2-neoforge:build       # one named node
-& $gradle -p . $lm chiseledBuild              # every node -- what CI runs
+& $gradle -p . $lm build                      # every node -- a bare name runs in every project
 & $gradle -p . $lm "Set active project to 1.21.4-neoforge"   # switch the active node
+
+# Stonecutter 0.7 has no chiseledBuild task: the bare `build` IS the all-node build. A bare
+# `runClient` is different -- it starts one client per node -- so always name the node there.
 ```
 
 Switching the active node **rewrites `src/`** to that version's state, by commenting and
@@ -135,6 +150,8 @@ they belong at 26.1 are at 26.2 or 26.3:
 | `RenderPipeline` → `com.mojang.renderpearl.api.pipeline` | 26.3 |
 | `InputConstants.Type.KEYBOARD` (was `KEYSYM`), `KeyEvent.keycode()` (was `scancode()`) | 26.3 |
 | `PoseStack.rotate(Axis, float)` | 26.3 |
+| `InputConstants.MOUSE_BUTTON_LEFT` is **1** (was 0): SDL numbers mouse buttons from one | 26.3 |
+| `Screen.render` starts calling `renderBackground` itself | 1.20.2 (1.20.1 has no such call) |
 
 Read the node's own `build/moddev/artifacts/*-sources.jar` before writing the bound rather
 than assuming from the major version. `javap` against the jar works too and is faster for a
@@ -160,6 +177,8 @@ makes an older node more than a version-number change.
 | Custom pipelines | 1.21.5+ | the hand-built `RenderType` no longer works; a `RenderPipeline` is registered instead |
 | Identifier rename | 1.21.9+ | `ResourceLocation` → `Identifier`, `location()` → `identifier()`, `RenderType` → `RenderTypes` |
 | Input records | 1.21.9 | mouse and key input became records; `Screen.hasControlDown()` moved to `Minecraft` |
+| Button numbering | 26.3 | SDL numbers the mouse buttons from one: left is 1, not 0. Never compare a button against a literal; `MouseButton.LEFT` is the one home for that number |
+| Screen backgrounds | <1.20.2 | `Screen.render` did not call `renderBackground`; a screen that wants the dimming and the sheet calls it itself, as `MainScreen` and the four other sheet screens now do below 1.20.2 |
 | GUI matrix stack | 1.21.6+ | `GuiGraphics.pose()` returns JOML's `Matrix3x2fStack`, not `PoseStack`. Xaero's own `MapElementGraphics` did **not** follow and still returns `PoseStack` |
 | Item ids | 1.21.4+ | `Item.Properties` must carry its id: register through `DeferredRegister.Items.registerItem`, not `register` with a supplier |
 | Immediate mode | 1.21.1-1.21.4 | `GuiGraphics.bufferSource()`, `RenderType.create`, `HudDraw.consumer(...)` -- the old model, still current at the anchor |
@@ -912,3 +931,41 @@ Stonecutter -- and both cost ongoing maintenance rather than a one-off change.
 Everything Forge-specific has been deleted: build.forge.gradle.kts, forge-build/, versions/*-forge/,
 the ForgeGradle plugin declaration and its version property. What remains above is the record of the
 investigation.
+
+### 26.x Fabric dev runs: the release Fabric API, and why
+
+`./gradlew :26.1-fabric:runClient` used to die before the game window with
+
+    ClassTweakerFormatException: Namespace (named) does not match current runtime namespace (official)
+
+Three facts make that inevitable and none of them is a bug in this mod:
+
+- The 26.x Minecraft jars are not obfuscated, so `src/fabric/aw/identity-mappings.jar` records **no
+  mapping entries** -- there is nothing to rename.
+- fabric-loader reads the dev **runtime namespace** out of those mappings:
+  `MappingConfiguration.computeRuntimeNamespace` answers `named` only when the mapping set is
+  non-empty *and* the game runs in a development environment; an empty mapping means `official`.
+- Loom, meanwhile, remaps every development mod dependency to the mapping **target** namespace and
+  rewrites its class tweaker header with it -- `named`. The headers that then mismatch belong to
+  Fabric API's own modules (`fabric-transitive-access-wideners-v1` on 26.1,
+  `fabric-renderer-indigo` on 26.3), so no change to this mod's access widener can help.
+
+The fix is to stop running Fabric API from Loom's dev jars on these three nodes and use what a real
+launcher uses: the **release** jar in `run/mods`, where fabric-loader treats it as an ordinary
+third-party mod and remaps it (class tweakers included) to whatever namespace the runtime is in.
+`build.fabric.gradle.kts` does both halves -- `modRuntimeClasspath` excludes Loom's remapped modules
+(group `remapped.net.fabricmc.fabric-api`), and `copyProductionFabricApi` resolves
+`net.fabricmc.fabric-api:fabric-api:<node version>` and drops it in `run/mods`, deleting any previous
+fabric-api jar there first so the loader never sees two copies of the same mod id. Compilation still
+uses the dev jars.
+
+Consequences worth knowing:
+
+- The released jars are unaffected: `remapJar` still post-processes the delivered access widener to an
+  `official` header, which is what a production Fabric install needs (its runtime namespace is also
+  `official`, because Fabric's intermediary for 26.x is an empty mapping too).
+- A `run/mods` directory is machine-local (`run/` is git-ignored), so the copied jar is not in the
+  repository; the task recreates it on every `runClient`.
+- If a future Loom or fabric-loader derives the dev runtime namespace differently, the symptom to
+  look for is the same exception on a Fabric API module, and the answer is still "run the release jar
+  from `run/mods`".

@@ -11,6 +11,10 @@
 // one of the three this tree uses that runs on both Gradle 8 and Gradle 9. It was the Forge
 // side that forced Gradle 8 on the whole tree; see MIGRATION.md.
 
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
+
 // Declares this node's loader for the //? if fabric conditions in the shared source.
 // Declares the loader this node builds for, for the `//? if <loader>` conditions in the shared
 // source. All three are declared on every node, not just the true one: a condition naming a
@@ -35,6 +39,10 @@ val minecraftVersion = stonecutter.current.version
 // properties are in scope, so it is declared in settings.gradle.kts pluginManagement instead.
 val loaderVersion = property("deps.fabric_loader") as String
 val fabricApiVersion = property("deps.fabric_api") as String
+// The per-node Modrinth coordinate is the fallback when libs/ has no matching Xaero jar.
+val xaeroCoordinate = property("deps.xaero") as String
+// Fabric VersionPredicate syntax, not Maven range syntax. The 1.39.x nodes override this.
+val xaeroRange = findProperty("deps.xaero_range")?.toString() ?: ">=1.40.0"
 val modVersion = rootProject.property("mod_version") as String
 
 version = "$modVersion+$minecraftVersion"
@@ -51,6 +59,10 @@ val requiredJava = when {
 java.toolchain.languageVersion = JavaLanguageVersion.of(requiredJava.majorVersion)
 
 repositories {
+    // Maven Central through a mirror first, for the same network reason as the NeoForge script:
+    // Loom also pulls natives and mapping artifacts through Central, and the direct host's TLS
+    // handshake is intermittent here.
+    maven("https://maven.aliyun.com/repository/central") { name = "mavenCentralMirror" }
     mavenCentral()
     // Corrected copies of artifacts whose UPSTREAM publication is broken, consulted before the
     // repository that publishes them. Restricted by content to the one module it fixes, so it
@@ -70,16 +82,59 @@ repositories {
     maven("https://maven.fabricmc.net/") { name = "Fabric" }
     // Xaero's own developer Maven. The shipped jar works too and is what libs/ holds.
     maven("https://chocolateminecraft.com/maven") { name = "ChocolateMinecraft" }
+    // Fallback for checkouts without a matching libs/ Xaero jar. Loom remaps this
+    // Modrinth artifact exactly as it remaps the local jar.
+    maven("https://api.modrinth.com/maven") {
+        name = "Modrinth"
+        content { includeGroup("maven.modrinth") }
+    }
     flatDir { dirs(rootProject.file("libs")) }
 }
 
-dependencies {
-    // The node's NAME is the logical version; the Minecraft version it compiles against can be a
-// patch of it -- the 26.1 node's is 26.1.2. A NeoForge node gets this for free, because
-// ModDevGradle derives the Minecraft version from the NeoForge version it is given; a Fabric node
-// has to be told, so deps.minecraft_version overrides it where the two differ.
+// The Minecraft artifact version, hoisted out of the dependency block below so the minimap gate can
+// select its jar by the same version. The node's NAME is the logical version; the version it
+// compiles against can be a patch of it -- the 26.1 node's is 26.1.2 -- and a NeoForge node gets
+// this for free, because ModDevGradle derives the Minecraft version from the NeoForge version it is
+// given; a Fabric node has to be told, so deps.minecraft_version overrides it where the two differ.
 val minecraftArtifactVersion = findProperty("deps.minecraft_version")?.toString() ?: minecraftVersion
-minecraft("com.mojang:minecraft:$minecraftArtifactVersion")
+
+// The Xaero's Minimap navigation overlay compiles against the minimap's element-render API. That is
+// an abstract class to subclass, not an interface to reflect over, so this integration cannot be
+// reached the way MTR, Create and RoadWeaver are: the overlay's own sources can only be compiled on
+// a node whose libs/ holds a minimap jar for that node's Minecraft generation.
+//
+// So the jar's presence decides what is compiled, exactly as it does for the NeoForge nodes: with a
+// jar the package is compiled against it (see the dependency block), without one it is excluded from
+// the source set and the node builds unchanged. What such a node loses is exactly one feature -- the
+// map_display_mode=xaero_minimap overlay -- and not silently: the display-mode router is an
+// always-compiled reflective bridge that notices the missing class and falls back to the in-HUD map
+// with one log line explaining why.
+//
+// Deliberately NOT a declared or hard dependency, unlike Xaero's World Map, which every road and
+// route already renders through; the minimap is only an alternative place to draw the same route.
+//
+// Selected by this node's Minecraft version -- the file name carries it -- and recognised by the
+// class the overlay must subclass rather than by file name alone, so a stray jar from another
+// generation is treated as absent instead of failing javac with a version mismatch. Xaero names its
+// Fabric jars two ways; only the loader-first one is the minimap's spelling, so only it is accepted.
+val minimapApiJar = fileTree(rootProject.file("libs")) {
+    include("xaerominimap-fabric-$minecraftArtifactVersion-*.jar")
+}.find { f ->
+    try {
+        // ZipFile, not java.util.zip.ZipFile: in a Kotlin build script `java` is the Java plugin
+        // extension and shadows the package root.
+        ZipFile(f).getEntry("xaero/hud/minimap/element/render/MinimapElementRenderer.class") != null
+    } catch (ignored: Exception) {
+        false
+    }
+}
+
+if (minimapApiJar == null) {
+    sourceSets.main.get().java.exclude("**/xaero/minimap/**")
+}
+
+dependencies {
+    minecraft("com.mojang:minecraft:$minecraftArtifactVersion")
     // Official Mojang mappings, NOT Yarn. The whole codebase is written against net.minecraft.*
     // official names -- 33k lines of it, shared with the NeoForge and Forge nodes -- so moving to
     // Yarn would be a rename pass with no functional gain, and would be the one thing that made
@@ -110,8 +165,11 @@ if (stonecutter.eval(minecraftVersion, ">=26.1")) {
 }
 
     // Xaero's World Map, as the FABRIC build of it -- the NeoForge jar is a different artifact
-    // and its classes will not load here. Only the world map is a compile input: MTR, Create and
-    // Xaero's Minimap are reached by reflection, so they are runtime mods and deliberately absent.
+    // and its classes will not load here. Only the world map is a compile input from the
+    // always-compiled source: MTR, Create and Xaero's Minimap are reached by reflection from it, so
+    // they are runtime mods and deliberately absent. Xaero's Minimap's one non-reflective piece --
+    // the route overlay, which has to subclass its element renderer -- is compiled only when this
+    // node supplied its jar, as the gate above says.
     //
     // Loom remaps this jar to the official names on the way in, which is why the file name does
     // not have to say so; see libs/README.md.
@@ -123,12 +181,97 @@ if (stonecutter.eval(minecraftVersion, ">=26.1")) {
     if (xaerolib.isNotEmpty()) {
         modCompileOnly(fileTree(rootProject.file("libs")) { include(xaerolib) })
     }
-    modCompileOnly(fileTree(rootProject.file("libs")) { // Xaero names its Fabric jars two ways: "xaeroworldmap-fabric-<mc>-<ver>.jar" from 1.21.8 on, and
-    // "XaerosWorldMap_<ver>_Fabric_<mc>.jar" before that. Both are accepted rather than renaming the
-    // download, because a local file whose name is not the one upstream publishes is a trap for
-    // whoever has to replace it.
-    include("xaeroworldmap-fabric-$minecraftArtifactVersion-*.jar",
-            "XaerosWorldMap_*_Fabric_$minecraftArtifactVersion.jar") })
+    val xaeroJar = fileTree(rootProject.file("libs")) {
+        // Xaero names its Fabric jars two ways: "xaeroworldmap-fabric-<mc>-<ver>.jar" from
+        // 1.21.8 on, and "XaerosWorldMap_<ver>_Fabric_<mc>.jar" before that. Both are accepted
+        // rather than renaming the download.
+        include("xaeroworldmap-fabric-$minecraftArtifactVersion-*.jar",
+                "XaerosWorldMap_*_Fabric_$minecraftArtifactVersion.jar")
+    }
+    if (xaeroJar.isEmpty) {
+        // No local jar: resolve the node's Modrinth coordinate. Loom remaps it for us.
+        modCompileOnly(xaeroCoordinate)
+    } else {
+        modCompileOnly(xaeroJar)
+    }
+
+    // The Xaero's Minimap overlay's API jar, when this node supplied one: see the note above the
+    // exclusion for why it is optional, compile-only and selected by name. XaeroLib, whose types the
+    // minimap jar's signatures mention, is not added here -- the deps.xaerolib wiring just above
+    // already adds this node's extracted jar, and a second copy of the same classes says nothing new.
+    minimapApiJar?.let { modCompileOnly(files(it)) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 26.x: the runtime Fabric API is the release jar, not the one Loom remaps
+//
+// On every other node Loom's dev jars of Fabric API are the right thing to run against: Loom remaps
+// them to the mapping target namespace, which is the namespace the dev client runs in.
+//
+// The 26.x nodes break that equivalence, and nothing in this project can repair it from here. Their
+// Minecraft jars are not obfuscated, so the identity mappings this build uses record no entries at
+// all -- and fabric-loader decides the dev runtime namespace from the mappings it is handed:
+// `MappingConfiguration.computeRuntimeNamespace` answers `named` only when the mapping set is
+// non-empty and the game is running in a development environment, and `official` otherwise. An empty
+// identity mapping is the second case, so the client runs in `official` while Loom rewrote every dev
+// jar's class tweaker header to the mapping target, `named`. The loader then refuses to start:
+//
+//   ClassTweakerFormatException: Namespace (named) does not match current runtime namespace (official)
+//
+// The failing files belong to Fabric API's own modules (fabric-transitive-access-wideners-v1 on 26.1,
+// fabric-renderer-indigo on 26.3, and whoever else the release decides to widen), so this mod's own
+// access widener cannot fix it -- that one is already delivered with an `official` header below.
+//
+// What does work is the shape a real launcher has: the PRODUCTION Fabric API in the run directory's
+// mods/ folder, where fabric-loader treats it as an ordinary third-party mod and remaps it -- class
+// tweakers included -- to the namespace the runtime is actually in. So the dev-remapped API stays as
+// the compile input and is excluded from the runtime classpath, and the release jar is copied into
+// run/mods before the client starts. Verified end to end on all three 26.x nodes: the audit runs in
+// build/audit passed their in-game self-test (9-10 checks each) with exactly this arrangement.
+val productionFabricApi by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+    // The release jar bundles its modules inside the jar, so nothing has to come along with it.
+    isTransitive = false
+}
+dependencies {
+    add(productionFabricApi.name, "net.fabricmc.fabric-api:fabric-api:$fabricApiVersion")
+}
+val copyProductionFabricApi = tasks.register<Copy>("copyProductionFabricApi") {
+    group = "fabric"
+    description = "Puts the release Fabric API into this node's run/mods, where a 26.x client needs it."
+    // Only the 26.x nodes run it: everywhere else the dev jar is correct and a second copy of the mod
+    // in run/mods would be a duplicate mod id.
+    onlyIf { stonecutter.eval(minecraftVersion, ">=26.1") }
+    val runMods = layout.projectDirectory.dir("run/mods").asFile
+    // One fabric-api jar only. The run directory is machine-local and may already hold a copy -- from
+    // the release the user downloaded by hand, or from an earlier wiring of this task -- and the loader
+    // refuses to start with two copies of the same mod id.
+    doFirst {
+        runMods.mkdirs()
+        runMods.listFiles { f -> f.isFile && f.name.startsWith("fabric-api") && f.name.endsWith(".jar") }
+            ?.forEach { stale ->
+                if (stale.delete()) {
+                    logger.lifecycle("run/mods: replaced ${stale.name} with the release Fabric API")
+                }
+            }
+    }
+    from(productionFabricApi) {
+        include("*.jar")
+        rename { "fabric-api-$fabricApiVersion.jar" }
+    }
+    into(runMods)
+}
+
+// The two halves of that decision, applied to the runtime classpath: the dev-remapped modules go,
+// and the release jar reaches the run directory. Excluding them by group is what the audit runs used
+// (build/audit/fabric-prodapi-generic.gradle); the group is Loom's, not Fabric's.
+if (stonecutter.eval(minecraftVersion, ">=26.1")) {
+    configurations.configureEach {
+        if (name.startsWith("modRuntimeClasspath")) {
+            exclude(group = "remapped.net.fabricmc.fabric-api")
+        }
+    }
 }
 
 // The access widener is chosen per version generation, because an entry naming a member that does
@@ -142,9 +285,9 @@ if (stonecutter.eval(minecraftVersion, ">=26.1")) {
 // The two do not overlap, so two files cover the range. The chosen one is renamed to
 // howtogo.accesswidener, which is the name fabric.mod.json asks for; the templates themselves are
 // excluded from the jar.
-// Three generations, not two: the 26.x nodes need the same members as modern but declared in the
-// intermediary namespace, because their jars are unobfuscated and Loom will not remap a "named"
-// widener onto an identity mapping.
+// Three generations, not two: the 26.x nodes need the same members as modern, but their jars are
+// unobfuscated and the runtime namespace is official; the post-processing below rewrites the
+// delivered copy to an official header for Fabric Loader.
 val awGeneration = when {
     stonecutter.eval(minecraftVersion, ">=26.1") -> "modern-intermediary"
     stonecutter.eval(minecraftVersion, ">=1.21.6") -> "modern"
@@ -154,9 +297,42 @@ val awGeneration = when {
 // them out of the jar also matches the copy this adds back, because the exclude is tested against the
 // source name before the rename -- which silently removed the access widener from the jar entirely.
 val awTemplate = rootProject.file("src/fabric/aw/$awGeneration.accesswidener")
+// Loom needs a `named` header to remap the 26.x widener, but the runtime namespace is
+// `official`. Keep the Loom input named and rewrite only the delivered/dev copies.
+
 // Computed OUTSIDE the loom block on purpose. Written inline it did not compile:
 // "Unresolved reference 'not' for operator '!'" -- the loom extension shadows `stonecutter`
 // inside its own scope, so the negation has to happen here where the plugin's is in view.
+
+// Loom needs the widener header to be `named` while it remaps, but 26.x runs in the
+// official namespace. Keep the build input named and rewrite only the delivered/dev copies.
+fun patchOfficialAccessWidener(file: File) {
+    if (!file.isFile) return
+    val tmp = File(file.parentFile, file.name + ".aw")
+    ZipFile(file).use { zin ->
+        ZipOutputStream(tmp.outputStream()).use { out ->
+            val entries = zin.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                val bytes = zin.getInputStream(entry).use { it.readBytes() }
+                val patched = if (entry.name == "howtogo.accesswidener") {
+                    String(bytes, Charsets.UTF_8)
+                        .replaceFirst("accessWidener v2 named", "accessWidener v2 official")
+                        .toByteArray(Charsets.UTF_8)
+                } else {
+                    bytes
+                }
+                val copy = ZipEntry(entry.name)
+                copy.time = entry.time
+                out.putNextEntry(copy)
+                out.write(patched)
+                out.closeEntry()
+            }
+        }
+    }
+    tmp.copyTo(file, overwrite = true)
+    tmp.delete()
+}
 val needsAccessWidener = true
 
 loom {
@@ -170,6 +346,15 @@ loom {
     if (needsAccessWidener) {
         accessWidenerPath = awTemplate
     }
+    // The in-game test rig opens a world for the player so the mod's own screens can be tried without
+    // walking the menus first -- the same switch build.neoforge.gradle.kts offers, because the rig is
+    // the same script for every node. Loom's run config is where the argument has to go: Gradle's
+    // --args would replace the launcher's own arguments rather than add to them.
+    if (rootProject.hasProperty("htgQuickPlay")) {
+        runs.named("client") {
+            programArgs("--quickPlaySingleplayer", rootProject.property("htgQuickPlay").toString())
+        }
+    }
 }
 
 // The shared tree, exactly as the NeoForge nodes take it: src/common is loader-free and
@@ -179,10 +364,33 @@ loom {
 // access widener are read by Fabric and by nothing else, so putting them in the shared resources
 // would ship them inside the NeoForge and Forge jars as well -- harmless, but it invites the
 // question of which loader a jar is for when the answer should be obvious from its contents.
+//
+// Both shared directories are copied into the node's own build directory unless this is the
+// active node, for the same IntelliJ content-root reason spelled out in build.neoforge.gradle.kts:
+// a directory registered by every node's module is de-duplicated down to one module by the IDE,
+// which leaves the active node without it. Copies are unique per node, so nothing is de-duplicated.
 sourceSets {
     main {
-        java.srcDir(rootProject.file("src/common/java"))
-        resources.srcDir(rootProject.file("src/fabric/resources"))
+        if (stonecutter.current.isActive) {
+            java.srcDir(rootProject.file("src/common/java"))
+            resources.srcDir(rootProject.file("src/fabric/resources"))
+        } else {
+            val commonCopy = layout.buildDirectory.dir("generated/common/java")
+            val syncCommon = tasks.register<Sync>("syncCommonSources") {
+                from(rootProject.file("src/common/java"))
+                into(commonCopy)
+            }
+            java.srcDir(commonCopy)
+            tasks.named<JavaCompile>("compileJava") { dependsOn(syncCommon) }
+
+            val fabricResourcesCopy = layout.buildDirectory.dir("generated/fabric-resources")
+            val syncFabricResources = tasks.register<Sync>("syncFabricResources") {
+                from(rootProject.file("src/fabric/resources"))
+                into(fabricResourcesCopy)
+            }
+            resources.srcDir(fabricResourcesCopy)
+            tasks.named<ProcessResources>("processResources") { dependsOn(syncFabricResources) }
+        }
     }
 }
 
@@ -213,6 +421,7 @@ tasks.named<ProcessResources>("processResources") {
         "version" to version.toString(),
         "minecraft_version" to minecraftVersion,
         "java_version" to requiredJava.majorVersion.toString(),
+        "xaero_range" to xaeroRange,
         // The accessWidener key is templated because 26.x must not declare one at all. Loom reads
         // this key independently of accessWidenerPath, so leaving it out of the loom block was not
         // enough -- the widener was still being applied, and still failing the same remap.
@@ -253,21 +462,22 @@ tasks.named<ProcessResources>("processResources") {
     // MIT requires the notice to travel with every copy, and the copy people receive is the jar.
     from(rootProject.file("LICENSE")) { into("META-INF") }
 
-    // The data pack, assembled for this node -- same three-way choice the NeoForge script makes,
-    // and for the same reasons. See the long comment there; the short version is that the data
-    // directory is plural before 1.21.1, the ingredient is an object before 1.21.4, and 1.20.5
-    // renamed the result's "item" to "id". Stonecutter does not touch resources, so the choice has
-    // to be made at copy time.
-    val recipeEra = when {
-        stonecutter.eval(minecraftVersion, ">=1.21.4") -> "recipe-modern"
-        stonecutter.eval(minecraftVersion, ">=1.20.5") -> "recipe-mid"
-        else -> "recipe-legacy"
+    // No data-pack copy here: src/main/datapack does not exist; the jars deliberately contain no data/**.
+}
+
+if (stonecutter.eval(minecraftVersion, ">=26.1")) {
+    tasks.named<net.fabricmc.loom.task.RemapJarTask>("remapJar") {
+        doLast { patchOfficialAccessWidener(archiveFile.get().asFile) }
     }
-    val singular = stonecutter.eval(minecraftVersion, ">=1.21.1")
-    from(rootProject.file("src/main/datapack/$recipeEra")) {
-        into("data/howtogo/" + if (singular) "recipe" else "recipes")
-    }
-    from(rootProject.file("src/main/datapack/advancement")) {
-        into("data/howtogo/" + if (singular) "advancement/recipes" else "advancements/recipes")
+    tasks.named("runClient") {
+        // The release Fabric API in run/mods is what the runtime loads on this node; see the
+        // productionFabricApi block above for why the dev-remapped modules cannot be used.
+        dependsOn(copyProductionFabricApi)
+        doFirst {
+            val aw = file("build/resources/main/howtogo.accesswidener")
+            if (aw.isFile) {
+                aw.writeText(aw.readText().replaceFirst("accessWidener v2 named", "accessWidener v2 official"))
+            }
+        }
     }
 }

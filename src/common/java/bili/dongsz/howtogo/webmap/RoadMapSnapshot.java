@@ -36,11 +36,52 @@ import java.util.TreeSet;
  * sides: {@code tools/routing-harness} asserts the key set and the values of a fixture network, and
  * {@code tools/webmap-test} feeds a payload of the same shape through the page's own parser. Adding a
  * field is therefore a two-place change, which is the point.
+ *
+ * <h2>Why places travel beside the roads</h2>
+ * A place is not a road: it has an owner, tags and a description that the road network knows nothing
+ * about, and a waypoint from another mod may be nowhere near a road at all. So the payload carries a
+ * {@code places} array of its own rather than decorating the {@code POI} nodes with the detail record
+ * -- the two are different questions, and a page that wants a marker does not have to understand a
+ * description to draw one. The array is built on the game's thread from every destination source, so
+ * a waypoint is on the browser map exactly when the in-game picker lists it.
+ *
+ * <p>That is the version-3 change: {@code places} was added and nothing was removed or renamed. The
+ * page still draws a payload without it (it derives markers from the POI nodes, as version 2 did),
+ * but only the new shape carries tags, the favourite flag and a cut-down description.
+ *
+ * <h2>The one field that is not a fact about the roads</h2>
+ * {@link #theme()} says which of the page's two palettes to draw the map in, because the browser map
+ * is a second surface of this mod and has to look like the interfaces beside it. It is resolved by
+ * the caller on the game's thread -- the config, the dimension and the sky are not questions an HTTP
+ * thread may ask -- and handed in as a word, exactly as the class colours are handed in as numbers.
  */
 public final class RoadMapSnapshot {
 
-    /** Bumped when a field's meaning changes; the page reads it to refuse a payload it cannot use. */
-    public static final int FORMAT_VERSION = 2;
+    /**
+     * Bumped when a field's meaning changes; the page reads it to refuse a payload it cannot use.
+     *
+     * <p>Version 3 added {@code places}: the tags, the favourite flag and the one-line description of
+     * every destination, which version 2 did not have at all. Nothing was removed, so the page's only
+     * obligation is the one it has always had -- ignore a field it does not know.
+     */
+    public static final int FORMAT_VERSION = 3;
+
+    /**
+     * The white style, as the page spells it in its {@code data-theme} attribute.
+     *
+     * <p>The words are the page's own -- "light" and "dark", the two its stylesheet and its
+     * normaliser agree on -- rather than a boolean, because the field is a hint to the page and the
+     * page's vocabulary is what decides what the two words mean.
+     */
+    public static final String LIGHT_THEME = "light";
+
+    /**
+     * The black style.
+     *
+     * <p>Also the answer for a caller that has no theme to give, which is the same answer the
+     * in-game theme gives when no world is loaded: see {@link #of(String, String, RoadNetwork)}.
+     */
+    public static final String DARK_THEME = "dark";
 
     /** One graph vertex, flattened. */
     public record Node(int id, int x, int y, int z, String type, String placeKind, String name) {
@@ -65,6 +106,40 @@ public final class RoadMapSnapshot {
      */
     public record Segment(int id, String roadClass, int y, int layer, int from, int to,
                           String direction, String name, int[] points, double[] curve, String source) {
+    }
+
+    /**
+     * One place, flattened for the page -- not a road, and not a graph vertex either.
+     *
+     * <p>{@code id} is the place's source-stable id ({@code PlaceKeys.stableId}), which is what the
+     * {@code /api/place} endpoint is asked about; {@code source} is the id of the
+     * {@code DestinationSource} it came from, so the page can badge it. {@code kind} is a
+     * {@code PlaceKind} name and is what the marker's colour is drawn from.
+     *
+     * <p>{@code description} is the <em>cut payload</em> form, not the full text: the description
+     * shortened to a couple of hundred characters with its line breaks kept, because the card can
+     * wrap. A road map's marker label is not a place to send half a kilobyte of prose per place, and
+     * the detail card fetches the rest on demand. {@code descriptionTruncated} says whether there is
+     * more, which is what decides whether the card offers the full-text button at all.
+     *
+     * <p>The constructor fills in a missing name, kind or description rather than failing: the payload
+     * is a reading of the client's sources, and one addon returning a null name should not be the
+     * reason a page cannot draw the map.
+     */
+    public record Place(String id, String name, int x, int y, int z, String kind, String source,
+                        List<String> tags, boolean favorite, String description,
+                        boolean descriptionTruncated) {
+
+        public Place {
+            id = id == null ? "" : id;
+            name = name == null ? "" : name;
+            kind = kind == null || kind.isBlank() ? "PLACE" : kind;
+            source = source == null ? "" : source;
+            // Null tags are dropped rather than thrown on: a payload is a reading of client stores,
+            // and one bad element should cost its chip and not the whole map.
+            tags = tags == null ? List.of() : tags.stream().filter(Objects::nonNull).toList();
+            description = description == null ? "" : description;
+        }
     }
 
     /**
@@ -96,9 +171,24 @@ public final class RoadMapSnapshot {
 
     private final String world;
     private final String dimension;
+    /**
+     * Which palette the page is to draw in, as the page spells it: {@link #LIGHT_THEME} or
+     * {@link #DARK_THEME}.
+     *
+     * <p>Never null, and never anything else: the factories reduce whatever the caller says to one of
+     * the two words, so the page has one branch and the payload has one possible shape.
+     */
+    private final String theme;
     private final Bounds bounds;
     private final List<Node> nodes;
     private final List<Segment> segments;
+    /**
+     * Places to mark, flattened from the destination sources on the game's thread.
+     *
+     * <p>Never null; an empty list is a world whose sources offer nothing, and the page then falls
+     * back to its version-1 behaviour of marking the POI nodes it was sent.
+     */
+    private final List<Place> places;
     private final int[] layers;
     private final double lengthBlocks;
     private final boolean empty;
@@ -113,14 +203,17 @@ public final class RoadMapSnapshot {
      */
     private final Map<RoadClass, Integer> classColours;
 
-    private RoadMapSnapshot(String world, String dimension, Bounds bounds, List<Node> nodes,
-                            List<Segment> segments, int[] layers, double lengthBlocks,
-                            boolean empty, Map<RoadClass, Integer> classColours) {
+    private RoadMapSnapshot(String world, String dimension, String theme, Bounds bounds,
+                            List<Node> nodes, List<Segment> segments, List<Place> places, int[] layers,
+                            double lengthBlocks, boolean empty,
+                            Map<RoadClass, Integer> classColours) {
         this.world = world;
         this.dimension = dimension;
+        this.theme = normaliseTheme(theme);
         this.bounds = bounds;
         this.nodes = List.copyOf(nodes);
         this.segments = List.copyOf(segments);
+        this.places = List.copyOf(places);
         this.layers = layers.clone();
         this.lengthBlocks = lengthBlocks;
         this.empty = empty;
@@ -146,6 +239,12 @@ public final class RoadMapSnapshot {
      * <p>Must be called on the thread that owns the network: this walks it. The result carries no
      * reference to it.
      *
+     * <p>The page is told the dark style. A caller that does not state a theme is one with no game
+     * to ask -- the standalone demo server, or a self-test that has no world loaded -- and dark is
+     * the same answer the in-game theme gives in that situation; see
+     * {@link #of(String, String, RoadNetwork, Map, List, String)} for the form that carries a real
+     * answer.
+     *
      * @param world        the world the data belongs to, for the page's own title; may be blank
      * @param dimension    the dimension id, e.g. {@code minecraft:overworld}
      * @param classColours the ARGB colour to draw each class in; a class left out keeps its own
@@ -153,7 +252,7 @@ public final class RoadMapSnapshot {
      */
     public static RoadMapSnapshot of(String world, String dimension, RoadNetwork network,
                                      Map<RoadClass, Integer> classColours) {
-        return of(world, dimension, network, classColours, List.of());
+        return of(world, dimension, network, classColours, List.of(), DARK_THEME);
     }
 
     /**
@@ -169,12 +268,65 @@ public final class RoadMapSnapshot {
      * <p>Must be called on the thread that owns the networks: this walks them. The result carries no
      * reference to any of them.
      *
+     * <p>The page is told the dark style, for the reason given on
+     * {@link #of(String, String, RoadNetwork, Map)}.
+     *
      * @param readOnlyLayers layers to fold in, in draw order (first under, last on top); may be empty
      */
     public static RoadMapSnapshot of(String world, String dimension, RoadNetwork network,
                                      Map<RoadClass, Integer> classColours,
                                      List<ReadOnlyLayer> readOnlyLayers) {
+        return of(world, dimension, network, classColours, readOnlyLayers, DARK_THEME);
+    }
+
+    /**
+     * Flattens a network, with the colours to draw each class in and the palette to draw the page in.
+     *
+     * <p>This is the form the running game uses: {@code WebMapService} reads the theme on the
+     * client thread, beside the colours and for the same reason, and hands the answer in as one of
+     * the two words above. Nothing is resolved here -- whether the sky is dark, whether the dimension
+     * has a sky at all, and what the player chose in the config are all questions only the game's
+     * thread may answer.
+     *
+     * <p>Must be called on the thread that owns the network: this walks it. The result carries no
+     * reference to it.
+     *
+     * @param theme the palette the page is to draw in, {@link #LIGHT_THEME} or {@link #DARK_THEME};
+     *              null or an unknown word is the dark style
+     */
+    public static RoadMapSnapshot of(String world, String dimension, RoadNetwork network,
+                                     Map<RoadClass, Integer> classColours,
+                                     List<ReadOnlyLayer> readOnlyLayers, String theme) {
+        return of(world, dimension, network, classColours, readOnlyLayers, theme, List.of());
+    }
+
+    /**
+     * Flattens a network together with the places the browser map is to mark.
+     *
+     * <p>This is the form the running game uses: the place list is built on the game's thread from
+     * {@code Destinations} and {@code PlaceDetailStore} -- the same sources the picker lists, so the
+     * two surfaces cannot disagree about which places exist -- and handed in beside the roads. The
+     * description each place carries is already cut to the payload's length; the full text is a
+     * separate request and deliberately not in this payload.
+     *
+     * <p>Places count towards the extent even when no road reaches them: the page fits its view to the
+     * payload's bounds, and a marker outside the box it was handed is a marker the player has to hunt
+     * for. A world with places but no roads is therefore not "empty" either -- there is something to
+     * draw.
+     *
+     * <p>Must be called on the thread that owns the network: this walks it. The result carries no
+     * reference to it or to the places it was given.
+     *
+     * @param places the places to mark, each already flattened; may be null or empty
+     */
+    public static RoadMapSnapshot of(String world, String dimension, RoadNetwork network,
+                                     Map<RoadClass, Integer> classColours,
+                                     List<ReadOnlyLayer> readOnlyLayers, String theme,
+                                     List<Place> places) {
         Objects.requireNonNull(network, "network");
+        List<Place> placeList = places == null
+                ? List.of()
+                : places.stream().filter(Objects::nonNull).toList();
         Map<RoadClass, Integer> colours = classColours == null ? Map.of() : classColours;
         List<ReadOnlyLayer> extraLayers = readOnlyLayers == null ? List.of() : readOnlyLayers;
 
@@ -246,7 +398,17 @@ public final class RoadMapSnapshot {
             }
         }
 
-        boolean nothing = nodes.isEmpty() && segments.isEmpty();
+        // Places last, and into the extent as well as into the payload: a waypoint from another mod
+        // may be nowhere near a road, and the page fits its view to the box it is handed -- so leaving
+        // one out is a marker off the edge until the player scrolls around looking for it.
+        for (Place place : placeList) {
+            minX = Math.min(minX, place.x());
+            maxX = Math.max(maxX, place.x());
+            minZ = Math.min(minZ, place.z());
+            maxZ = Math.max(maxZ, place.z());
+        }
+
+        boolean nothing = nodes.isEmpty() && segments.isEmpty() && placeList.isEmpty();
         Bounds bounds = nothing
                 ? new Bounds(0, 0, 0, 0)
                 : new Bounds(minX, minZ, maxX, maxZ);
@@ -257,7 +419,21 @@ public final class RoadMapSnapshot {
         }
         return new RoadMapSnapshot(world == null ? "" : world,
                 dimension == null || dimension.isBlank() ? "unknown" : dimension,
-                bounds, nodes, segments, layerArray, length, nothing, colours);
+                theme, bounds, nodes, segments, placeList, layerArray, length, nothing, colours);
+    }
+
+    /**
+     * A theme name reduced to one of the two words the page knows.
+     *
+     * <p>Anything that is not "light" becomes the dark style: a caller with no answer, a null, a
+     * word a newer version might have added. That is the same answer the in-game theme gives when no
+     * world is loaded, and it is the page's own default, so a payload carrying it can never be the
+     * reason a page comes up in a palette the player did not expect.
+     */
+    private static String normaliseTheme(String theme) {
+        return theme != null && LIGHT_THEME.equalsIgnoreCase(theme.trim())
+                ? LIGHT_THEME
+                : DARK_THEME;
     }
 
     /** One segment as the page receives it, with its display curve when it has one. */
@@ -308,9 +484,15 @@ public final class RoadMapSnapshot {
     /** The same, with the colours the legend is to be drawn in. */
     public static RoadMapSnapshot none(String world, String dimension,
                                        Map<RoadClass, Integer> classColours) {
+        return none(world, dimension, classColours, DARK_THEME);
+    }
+
+    /** The same, with the palette the page is to draw the empty map in; see {@link #of}. */
+    public static RoadMapSnapshot none(String world, String dimension,
+                                       Map<RoadClass, Integer> classColours, String theme) {
         return new RoadMapSnapshot(world == null ? "" : world,
                 dimension == null || dimension.isBlank() ? "unknown" : dimension,
-                new Bounds(0, 0, 0, 0), List.of(), List.of(), new int[0], 0.0, true,
+                theme, new Bounds(0, 0, 0, 0), List.of(), List.of(), List.of(), new int[0], 0.0, true,
                 classColours == null ? Map.of() : classColours);
     }
 
@@ -320,6 +502,18 @@ public final class RoadMapSnapshot {
 
     public String dimension() {
         return dimension;
+    }
+
+    /**
+     * The palette the page is to draw in, as the page spells it: {@link #LIGHT_THEME} or
+     * {@link #DARK_THEME}, never null.
+     *
+     * <p>Resolved from the config, the dimension and the sky before this snapshot existed; see
+     * {@link #of(String, String, RoadNetwork, Map, List, String)} for why it is carried rather than
+     * looked up by whoever is writing the JSON.
+     */
+    public String theme() {
+        return theme;
     }
 
     public Bounds bounds() {
@@ -334,12 +528,27 @@ public final class RoadMapSnapshot {
         return segments;
     }
 
+    /**
+     * The places the page is to mark, each with its tags, favourite flag and one-line description.
+     *
+     * <p>Empty for a reading taken by a caller that has no destination sources -- the harness, or a
+     * world being read before the client's sources have initialised -- which is what the page's POI
+     * fallback exists for.
+     */
+    public List<Place> places() {
+        return places;
+    }
+
     public int nodeCount() {
         return nodes.size();
     }
 
     public int segmentCount() {
         return segments.size();
+    }
+
+    public int placeCount() {
+        return places.size();
     }
 
     /** Every storey any road is on, ascending; the page uses it for the layer switches. */
@@ -374,6 +583,9 @@ public final class RoadMapSnapshot {
         root.put("world", world);
         root.put("dimension", dimension);
         root.put("empty", empty);
+        // Always present, even though the page tolerates its absence: this build always has an
+        // answer, and a field that is sometimes omitted is a field every reader has to branch on.
+        root.put("theme", theme);
 
         Map<String, Object> extent = new LinkedHashMap<>();
         extent.put("minX", bounds.minX());
@@ -444,6 +656,28 @@ public final class RoadMapSnapshot {
             segmentList.add(entry);
         }
         root.put("segments", segmentList);
+
+        // Always present, like every other list here: the page reads an absent list as "a payload
+        // from before places existed" and falls back to marking the POI nodes, while an empty one
+        // means this server really has no places to mark. Those are different answers and the page
+        // behaves differently for them, so the field is never omitted.
+        List<Map<String, Object>> placeList = new ArrayList<>(places.size());
+        for (Place place : places) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("id", place.id());
+            entry.put("name", place.name());
+            entry.put("x", place.x());
+            entry.put("y", place.y());
+            entry.put("z", place.z());
+            entry.put("kind", place.kind());
+            entry.put("source", place.source());
+            entry.put("tags", place.tags());
+            entry.put("favorite", place.favorite());
+            entry.put("description", place.description());
+            entry.put("descriptionTruncated", place.descriptionTruncated());
+            placeList.add(entry);
+        }
+        root.put("places", placeList);
 
         Map<String, Object> stats = new LinkedHashMap<>();
         stats.put("nodes", nodes.size());

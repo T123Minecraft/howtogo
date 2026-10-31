@@ -3,6 +3,9 @@ package bili.dongsz.howtogo.client;
 import bili.dongsz.howtogo.HowToGo;
 import bili.dongsz.howtogo.RoadConfig;
 import bili.dongsz.howtogo.api.SelfChecks;
+import bili.dongsz.howtogo.place.PlaceDetails;
+import bili.dongsz.howtogo.place.PlaceKey;
+import bili.dongsz.howtogo.place.PlaceSources;
 import bili.dongsz.howtogo.road.RoadClass;
 import bili.dongsz.howtogo.road.RoadSegment;
 import bili.dongsz.howtogo.route.Destination;
@@ -13,7 +16,6 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
-import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 // 1.21.9 bundled mouse coordinates and the button into a record.
 //? if >=1.21.9 {
@@ -38,10 +40,12 @@ import java.util.List;
  * map -- the map already has its own editing keys, and this screen is the alternative to the map.
  *
  * <h2>The map is a viewer, not a navigator</h2>
- * It draws the same roads, rails, places and route the world map does, and it drags and zooms, but a
- * click chooses nothing: picking a destination belongs to the destination screen, which this screen
- * opens. Keeping the two apart means the viewer can be simple enough to trust -- there is no hidden
- * mode, no selection, and no way to start a trip by looking at the map.
+ * It draws the same roads, rails, places and route the world map does, and it drags and zooms. A
+ * single click still chooses nothing: a double-click on a place opens that place's details, which is
+ * reading rather than travelling -- the card offers "navigate here", and only that button starts a
+ * trip. Picking a destination from a list belongs to the destination screen, which this screen
+ * opens. Keeping the two apart means the viewer can be simple enough to trust: there is no editing
+ * mode and no way to start a trip by looking at the map.
  *
  * <h2>What is not duplicated</h2>
  * Export and import already have their own screen with the archive list and the overwrite warning;
@@ -71,18 +75,37 @@ public final class MainScreen extends Screen {
     private static final double DEFAULT_SCALE = 0.30;
     private static final double ZOOM_STEP = 1.15;
 
-    private static final int COLOR_DIM = 0x90000000;
-    private static final int COLOR_PANEL = 0xF012171C;
-    private static final int COLOR_PANEL_EDGE = 0xFF2C3540;
-    private static final int COLOR_MAP_BACKDROP = 0xFF0B0F13;
-    private static final int COLOR_MAP_EDGE = 0xFF232B33;
-    private static final int COLOR_TITLE = 0xFFFFE070;
-    private static final int COLOR_TEXT = 0xFFD0D8E0;
-    private static final int COLOR_DIM_TEXT = 0xFF7E8B98;
-    private static final int COLOR_ROUTE = 0xFF4FA3FF;
-    private static final int COLOR_PLAYER = 0xFFFFFFFF;
+    /**
+     * How close two clicks on the same place have to be together to open the details.
+     *
+     * <p>The same figure a desktop uses for a double-click: long enough for a deliberate second
+     * press, short enough that two unrelated clicks on a marker are two clicks.
+     */
+    private static final long DOUBLE_CLICK_MS = 400L;
+
+    /**
+     * How far from a marker's centre a press still counts as a press on that marker.
+     *
+     * <p>Larger than the marker itself: at the default zoom a place is under two pixels across, and
+     * asking the player to hit two pixels would make the details panel unreachable except zoomed in.
+     * Small enough that two markers eight pixels apart are still two markers.
+     */
+    private static final double PLACE_HIT_HALF_PX = 8.0;
+
+    /** Movement beyond this between press and release turns the gesture into a drag, not a click. */
+    private static final double CLICK_SLOP_PX = 3.0;
+
+    /** The details card's widest form, and the gap it keeps from the map's edge. */
+    private static final int DETAIL_PANEL_WIDTH = 280;
+    private static final int DETAIL_PANEL_MARGIN = 4;
+
+    /** Half the size of the favourite badge: the marker's own scale rather than a second marker. */
+    private static final double FAVOURITE_BADGE_RADIUS = 2.0;
 
     private final List<String> notices = new ArrayList<>();
+
+    /** The two rows of buttons, built in {@link #init()} and drawn and hit-tested by hand. */
+    private final List<PanelButton> buttons = new ArrayList<>();
 
     /** View centre in world blocks, and the zoom. Kept across a resize, not across screens. */
     private double centerX;
@@ -93,6 +116,28 @@ public final class MainScreen extends Screen {
     private boolean dragging;
     private double lastMouseX;
     private double lastMouseY;
+
+    /**
+     * The place whose details are showing, or null when no details card is up.
+     *
+     * <p>The card is a property of this screen rather than a screen of its own -- see
+     * {@link PlaceDetailPanel} -- and it deliberately outlives the press that opened it: the map
+     * keeps drawing behind it, and the player reads a description over the roads it describes.
+     */
+    private Destination selectedPlace;
+
+    /** The one card this screen draws; it remembers its own controls between a render and a click. */
+    private final PlaceDetailPanel detailPanel = new PlaceDetailPanel();
+
+    /** The place under a press that is still down, and where that press began. */
+    private Destination pressedPlace;
+    private double pressX;
+    private double pressY;
+    private boolean pressMoved;
+
+    /** The last place clicked and when, which is the whole of the double-click test. */
+    private Destination lastClickedPlace;
+    private long lastClickedAt;
 
     private int panelX;
     private int panelY;
@@ -129,7 +174,12 @@ public final class MainScreen extends Screen {
         mapY = panelY + PAD + TITLE_HEIGHT + 2;
         int rowsTop = panelY + panelH - PAD - BUTTON_HEIGHT * 2 - GAP;
         int statusTop = mapY + 4;
-        int mapBottom = rowsTop - LINE_HEIGHT * 4 - GAP;
+        // Five lines between the map and the buttons: the mode, the trip (or the idle line), the
+        // totals, one notice, and the browser map's address when it is running. The address used to
+        // be placed by its own formula at the foot of the panel, which came out on exactly the line
+        // the first notice is drawn on -- so with the browser map running, any notice was painted on
+        // top of the address. Reserving the line here is what keeps the two apart.
+        int mapBottom = rowsTop - LINE_HEIGHT * 5 - GAP;
         mapH = Math.max(60, mapBottom - mapY);
         if (mapH > (panelH * MAP_SHARE) / 100) {
             mapH = (panelH * MAP_SHARE) / 100;
@@ -147,32 +197,61 @@ public final class MainScreen extends Screen {
         int row2Y = panelY + panelH - PAD - BUTTON_HEIGHT;
         int row1Y = row2Y - BUTTON_HEIGHT - GAP;
 
+        buttons.clear();
         int third = (inner - GAP * 2) / 3;
-        addRenderableWidget(Button.builder(
-                        Component.translatable("screen.howtogo.main.destination"), b -> openDestination())
-                .bounds(panelX + PAD, row1Y, third, BUTTON_HEIGHT).build());
-        addRenderableWidget(Button.builder(
-                        Component.translatable("screen.howtogo.main.stop"), b -> stopNavigation())
-                .bounds(panelX + PAD + third + GAP, row1Y, third, BUTTON_HEIGHT).build());
-        addRenderableWidget(Button.builder(
-                        Component.translatable("screen.howtogo.main.mode"), b -> cycleMode())
-                .bounds(panelX + PAD + (third + GAP) * 2, row1Y, third, BUTTON_HEIGHT).build());
+        buttons.add(new PanelButton(panelX + PAD, row1Y, third, BUTTON_HEIGHT,
+                Component.translatable("screen.howtogo.main.destination"),
+                PanelButton.Kind.PRIMARY, this::openDestination));
+        buttons.add(new PanelButton(panelX + PAD + third + GAP, row1Y, third, BUTTON_HEIGHT,
+                Component.translatable("screen.howtogo.main.stop"),
+                PanelButton.Kind.NEUTRAL, this::stopNavigation));
+        buttons.add(new PanelButton(panelX + PAD + (third + GAP) * 2, row1Y, third, BUTTON_HEIGHT,
+                Component.translatable("screen.howtogo.main.mode"),
+                PanelButton.Kind.NEUTRAL, this::cycleMode));
 
         int quarter = (inner - GAP * 3) / 4;
-        addRenderableWidget(Button.builder(
-                        Component.translatable("screen.howtogo.main.data"), b -> openMapData())
-                .bounds(panelX + PAD, row2Y, quarter, BUTTON_HEIGHT).build());
-        addRenderableWidget(Button.builder(
-                        Component.translatable("screen.howtogo.main.selftest"), b -> runSelfTest())
-                .bounds(panelX + PAD + quarter + GAP, row2Y, quarter, BUTTON_HEIGHT).build());
-        addRenderableWidget(Button.builder(
-                        Component.translatable("screen.howtogo.main.webmap"), b -> toggleWebMap())
-                .bounds(panelX + PAD + (quarter + GAP) * 2, row2Y, quarter, BUTTON_HEIGHT).build());
-        addRenderableWidget(Button.builder(Component.translatable("gui.done"), b -> onClose())
-                .bounds(panelX + PAD + (quarter + GAP) * 3, row2Y, quarter, BUTTON_HEIGHT).build());
+        buttons.add(new PanelButton(panelX + PAD, row2Y, quarter, BUTTON_HEIGHT,
+                Component.translatable("screen.howtogo.main.data"),
+                PanelButton.Kind.NEUTRAL, this::openMapData));
+        buttons.add(new PanelButton(panelX + PAD + quarter + GAP, row2Y, quarter, BUTTON_HEIGHT,
+                Component.translatable("screen.howtogo.main.selftest"),
+                PanelButton.Kind.NEUTRAL, this::runSelfTest));
+        buttons.add(new PanelButton(panelX + PAD + (quarter + GAP) * 2, row2Y, quarter,
+                BUTTON_HEIGHT, Component.translatable("screen.howtogo.main.webmap"),
+                PanelButton.Kind.NEUTRAL, this::toggleWebMap));
+        buttons.add(new PanelButton(panelX + PAD + (quarter + GAP) * 3, row2Y, quarter,
+                BUTTON_HEIGHT, Component.translatable("gui.done"),
+                PanelButton.Kind.NEUTRAL, this::onClose));
 
-        // The status block sits between the map and the buttons; remember where it starts.
-        this.statusY = Math.max(statusTop, row1Y - LINE_HEIGHT * 4 - 2);
+        // Settings, on the title line rather than in a third button row: the panel's height is
+        // shared with the map, and a third row would take room from it to hold one control. The
+        // title line has had empty space at its right end since this screen existed, and the
+        // button is drawn and hit-tested by the same list as the rows below, so it costs no
+        // geometry and no new click routing.
+        String settingsLabel = Component.translatable("screen.howtogo.main.settings").getString();
+        int settingsWidth = Math.max(52, this.font.width(settingsLabel) + 12);
+        buttons.add(new PanelButton(panelX + panelW - PAD - settingsWidth, panelY + PAD - 3,
+                settingsWidth, 14, Component.translatable("screen.howtogo.main.settings"),
+                PanelButton.Kind.NEUTRAL, this::openSettings));
+
+        // The status block sits between the map and the buttons; remember where it starts, and
+        // where the first row of buttons starts, because that is the block's floor.
+        this.firstButtonY = row1Y;
+        this.statusY = Math.max(statusTop, row1Y - LINE_HEIGHT * 5 - 2);
+    }
+
+    /**
+     * The two rows of buttons at the foot of the panel.
+     *
+     * <p>Drawn here rather than handed to the widget list, which is why {@link #render} has to draw
+     * them itself: a vanilla button is a grey system widget in a panel that is otherwise this mod's
+     * own, and the white style made that the one thing on the screen that did not belong to it. See
+     * {@link PanelButton} for the trade that comes with drawing them.
+     */
+    private void drawButtons(GuiGraphics graphics, int mouseX, int mouseY) {
+        for (PanelButton button : buttons) {
+            button.render(graphics, font, mouseX, mouseY);
+        }
     }
 
     /** A place name and where it goes on the map, collected in the shape pass and drawn after it. */
@@ -182,6 +261,9 @@ public final class MainScreen extends Screen {
     /** Top of the status block under the map, worked out in {@link #init()}. */
     private int statusY;
 
+    /** Top of the first row of buttons: the floor the status block may not draw past. */
+    private int firstButtonY;
+
     // ------------------------------------------------------------------ actions
 
     private void openDestination() {
@@ -190,6 +272,17 @@ public final class MainScreen extends Screen {
 
     private void openMapData() {
         Screens.set(new MapDataScreen(this));
+    }
+
+    /**
+     * Opens the in-game settings.
+     *
+     * <p>A screen of its own rather than a section of this one: the settings are a list with
+     * scrolling, grouped rows and controls, and keeping them off the map keeps this screen's two
+     * jobs -- showing the trip and starting a new one -- as the only things on it.
+     */
+    private void openSettings() {
+        Screens.set(new SettingsScreen(this));
     }
 
     private void stopNavigation() {
@@ -219,7 +312,9 @@ public final class MainScreen extends Screen {
             // The same manual start as the command: open the page rather than leave a bare address
             // that only a click would turn into a browser, and a click would ask for confirmation.
             OsShell.openUrl(url);
-            notice(Component.translatable("screen.howtogo.main.webmap_running", url).getString());
+            // No notice for the successful start: the address line under the notices is the same
+            // address in the same words, so a notice saying it too would be two identical lines one
+            // under the other. The line appearing is the confirmation.
         } catch (IOException | RuntimeException failed) {
             HowToGo.LOGGER.warn("[HowToGo] webmap | could not start: {}", failed.toString());
             notice(Component.translatable("screen.howtogo.main.webmap_failed",
@@ -264,8 +359,18 @@ public final class MainScreen extends Screen {
         }
     }
 
-    /** Puts one line at the top of the notice block, keeping the block to a readable size. */
+    /**
+     * Puts one line at the top of the notice block, keeping the block to a readable size.
+     *
+     * <p>A line identical to the newest one is dropped rather than stacked: two controls that
+     * report the same thing (the stop button pressed twice, the browser map's address both as a
+     * notice and on its own line) would otherwise put the same words on two consecutive lines, which
+     * reads as a rendering fault rather than as a second answer.
+     */
     private void notice(String line) {
+        if (!notices.isEmpty() && notices.get(0).equals(line)) {
+            return;
+        }
         notices.add(0, line);
         while (notices.size() > 4) {
             notices.remove(notices.size() - 1);
@@ -275,6 +380,159 @@ public final class MainScreen extends Screen {
     @Override
     public void onClose() {
         Screens.set(null);
+    }
+
+    // ------------------------------------------------------------ place details
+
+    /**
+     * Records a press-and-release on the map that was not a drag.
+     *
+     * <p>The second click on the same place within {@link #DOUBLE_CLICK_MS} opens the details. A
+     * click on the empty map is not the first half of anything: it clears the pending click, so two
+     * background presses can never open whichever marker the next click happens to land on.
+     */
+    private void registerMapClick(Destination place) {
+        if (place == null) {
+            lastClickedPlace = null;
+            return;
+        }
+        long now = System.currentTimeMillis();
+        boolean second = lastClickedPlace != null && now - lastClickedAt <= DOUBLE_CLICK_MS
+                && samePlace(lastClickedPlace, place);
+        // Cleared after a successful double-click, so a third press starts over rather than opening
+        // the same card twice.
+        lastClickedPlace = second ? null : place;
+        lastClickedAt = now;
+        if (second) {
+            selectPlace(place);
+        }
+    }
+
+    /** Whether two destinations name the same stored place; their source and id decide it. */
+    private static boolean samePlace(Destination first, Destination second) {
+        if (first == null || second == null) {
+            return false;
+        }
+        PlaceKey firstKey = PlaceDetailStore.keyOf(first);
+        PlaceKey secondKey = PlaceDetailStore.keyOf(second);
+        return firstKey != null && firstKey.equals(secondKey);
+    }
+
+    /** Shows a place's details. */
+    private void selectPlace(Destination place) {
+        if (!Destinations.isPlace(place)) {
+            return;
+        }
+        selectedPlace = place;
+    }
+
+    /**
+     * The place whose marker is inside the click tolerance of a point, or null.
+     *
+     * <p>Nearest wins: two markers can both be inside the tolerance, and the one the pointer is on
+     * is the one that was aimed at. Every place this map draws is selectable -- the map has no
+     * filter panel of its own, so what is on screen is exactly the list walked here.
+     */
+    private Destination placeAt(double mouseX, double mouseY) {
+        Destination nearest = null;
+        double nearestDistance = PLACE_HIT_HALF_PX;
+        for (Destination place : Destinations.places()) {
+            double distance = Math.hypot(screenX(place.x()) - mouseX, screenY(place.z()) - mouseY);
+            if (distance <= nearestDistance) {
+                nearestDistance = distance;
+                nearest = place;
+            }
+        }
+        return nearest;
+    }
+
+    /**
+     * The selected place as the sources state it now, or null when no source has it any more.
+     *
+     * <p>The reference taken when the card opened goes stale as soon as the place is edited from the
+     * card itself: name and kind are rebuilt from source data every frame, so drawing the reference
+     * would keep showing the old name after the player's own rename. A place no source lists any
+     * more -- deleted in the map's edit mode, or its mod gone -- is nothing to describe either, and a
+     * card offering edit for it could only fail.
+     */
+    private Destination liveSelectedPlace() {
+        if (selectedPlace == null) {
+            return null;
+        }
+        PlaceKey key = PlaceDetailStore.keyOf(selectedPlace);
+        if (key == null) {
+            return null;
+        }
+        for (Destination place : Destinations.places()) {
+            if (key.equals(PlaceDetailStore.keyOf(place))) {
+                return place;
+            }
+        }
+        return null;
+    }
+
+    /** One of the details card's controls was clicked. */
+    private void clickDetailPanel(double mouseX, double mouseY) {
+        PlaceDetailPanel.Action action = detailPanel.actionAt(mouseX, mouseY);
+        if (action == PlaceDetailPanel.Action.NONE || selectedPlace == null) {
+            // A press on the card's blank space is still a press on the card: it must not fall
+            // through to the map.
+            return;
+        }
+        switch (action) {
+            case FAVORITE -> PlaceDetailStore.toggleFavorite(selectedPlace);
+            case EDIT -> editSelectedPlace();
+            case NAVIGATE -> {
+                Navigation.setTarget(selectedPlace);
+                // The same commit the picker makes: the trip is set and the screen goes away, so the
+                // HUD, not this map, is what the player looks at next.
+                onClose();
+            }
+            case BACK -> {
+                // Collapse only: the map stays where it was, and the screen stays open.
+                selectedPlace = null;
+            }
+            default -> {
+                // NONE is handled above; DELETE is not offered by a details card. A place is deleted
+                // in the world map's edit mode, where the node, its roads and the undo history are.
+            }
+        }
+    }
+
+    /**
+     * Opens the place editor for the selected place.
+     *
+     * <p>Two editors behind one button, because a place's text is stored in two different places: the
+     * player's own node lives in the road network and is edited by the map's place editor, while a
+     * place read from another mod has no node to edit and is edited by the detail dialog writing the
+     * store directly. Which one applies is the source's answer, exactly as in the picker.
+     */
+    private void editSelectedPlace() {
+        Destination place = selectedPlace;
+        if (place == null) {
+            return;
+        }
+        if (PlaceSources.isManual(place.source())) {
+            int nodeId = manualNodeId(place);
+            if (nodeId >= 0) {
+                RoadEditSession.openPlaceEditorFromPanel(nodeId);
+            }
+            return;
+        }
+        PlaceDetailScreen.openForStore(Screens.current(), place);
+    }
+
+    /** The road node id of a hand-placed place, or -1 when the place is not one. */
+    private static int manualNodeId(Destination place) {
+        if (place == null || !PlaceSources.isManual(place.source()) || place.placeId() == null) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(place.placeId().trim());
+        } catch (NumberFormatException notANode) {
+            // A record whose id is not a node id: there is nothing in the network to edit.
+            return -1;
+        }
     }
 
     // ------------------------------------------------------------------- input
@@ -288,10 +546,33 @@ public final class MainScreen extends Screen {
     *///?} else {
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
     //?}
-        if (button == 0 && insideMap(mouseX, mouseY)) {
+        // The details card is on top of the map, so it sees the click before the map does: a press
+        // inside the card is a press on the card's empty space or on one of its controls, never the
+        // beginning of a drag that would move the map under it.
+        if (button == MouseButton.LEFT && selectedPlace != null && detailPanel.contains(mouseX, mouseY)) {
+            clickDetailPanel(mouseX, mouseY);
+            return true;
+        }
+        // The buttons are drawn, not widgets, so nothing else will route a click to them: this is
+        // their only chance to see it, and it comes before the map so a click on a button is never
+        // also a drag that moves the view under it.
+        if (button == MouseButton.LEFT) {
+            for (PanelButton candidate : buttons) {
+                if (candidate.click(mouseX, mouseY)) {
+                    return true;
+                }
+            }
+        }
+        if (button == MouseButton.LEFT && insideMap(mouseX, mouseY)) {
             dragging = true;
             lastMouseX = mouseX;
             lastMouseY = mouseY;
+            // Which marker the press was on, and where it started: the release needs both to tell a
+            // click from a drag.
+            pressedPlace = placeAt(mouseX, mouseY);
+            pressX = mouseX;
+            pressY = mouseY;
+            pressMoved = false;
             return true;
         }
         //? if >=1.21.9 {
@@ -311,7 +592,12 @@ public final class MainScreen extends Screen {
     *///?} else {
     public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
     //?}
-        if (dragging && button == 0) {
+        if (dragging && button == MouseButton.LEFT) {
+            // A gesture that moved is a pan, not a click: recording it would make dragging the map
+            // open whatever was under the first press.
+            if (Math.hypot(mouseX - pressX, mouseY - pressY) > CLICK_SLOP_PX) {
+                pressMoved = true;
+            }
             centerX -= dragX / scale;
             centerZ -= dragY / scale;
             lastMouseX = mouseX;
@@ -335,8 +621,15 @@ public final class MainScreen extends Screen {
     *///?} else {
     public boolean mouseReleased(double mouseX, double mouseY, int button) {
     //?}
-        if (dragging && button == 0) {
+        if (dragging && button == MouseButton.LEFT) {
             dragging = false;
+            Destination pressed = pressedPlace;
+            pressedPlace = null;
+            // The click is decided on release, because only then is it known whether the gesture was
+            // a click at all; a drag over a marker must pan the map and select nothing.
+            if (!pressMoved) {
+                registerMapClick(pressed);
+            }
             return true;
         }
         //? if >=1.21.9 {
@@ -406,18 +699,40 @@ public final class MainScreen extends Screen {
     //?} else {
     /*public void renderBackground(GuiGraphics graphics) {
     *///?}
-        graphics.fill(0, 0, this.width, this.height, COLOR_DIM);
+        graphics.fill(0, 0, this.width, this.height, UiTheme.dim());
         graphics.fill(panelX - 1, panelY - 1, panelX + panelW + 1, panelY + panelH + 1,
-                COLOR_PANEL_EDGE);
-        graphics.fill(panelX, panelY, panelX + panelW, panelY + panelH, COLOR_PANEL);
+                UiTheme.panelEdge());
+        graphics.fill(panelX, panelY, panelX + panelW, panelY + panelH, UiTheme.panel());
     }
 
+    /**
+     * The frame.
+     *
+     * <p>{@code super.render} first, and not for the widgets: it is what calls
+     * {@link #renderBackground} and so puts the dimming and the sheet on the screen at all. This
+     * screen draws its own map and text over that sheet, which is why it does not look like the other
+     * screens -- but it still has to ask the parent for the background, and a version of this method
+     * that only drew the map and the text left every piece of chrome off the screen: no dimming, no
+     * card, no buttons. (The buttons have since stopped being widgets; the background call is still
+     * what the parent is for.)
+     */
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+        // 1.20.2 is where the game started drawing a screen's background from Screen.render itself.
+        // 1.20.1 has no such call, so a screen that wants the dimming and the sheet asks for it here.
+        //? if <1.20.2 {
+        /*renderBackground(graphics);
+        *///?}
+        super.render(graphics, mouseX, mouseY, partialTick);
         // Shapes first, then every piece of text: drawing a string flushes the vertex buffer this
         // uses, so a shape emitted after one would go through a stale consumer.
         List<MapLabel> labels = drawMap(graphics);
-        drawText(graphics, labels);
+        drawText(graphics, labels, mouseX, mouseY);
+        // The details card last and alone: it is an opaque sheet floating over one corner of the map,
+        // so every label the map drew under it has to come first. It opens its own drawing blocks
+        // internally, which is also why it cannot be called inside the map's block above.
+        drawDetailPanel(graphics, mouseX, mouseY);
+        drawButtons(graphics, mouseX, mouseY);
     }
 
     /**
@@ -427,11 +742,11 @@ public final class MainScreen extends Screen {
      */
     private List<MapLabel> drawMap(GuiGraphics graphics) {
         List<MapLabel> labels = new ArrayList<>();
-        graphics.fill(mapX, mapY, mapX + mapW, mapY + mapH, COLOR_MAP_BACKDROP);
-        graphics.fill(mapX, mapY, mapX + mapW, mapY + 1, COLOR_MAP_EDGE);
-        graphics.fill(mapX, mapY + mapH - 1, mapX + mapW, mapY + mapH, COLOR_MAP_EDGE);
-        graphics.fill(mapX, mapY, mapX + 1, mapY + mapH, COLOR_MAP_EDGE);
-        graphics.fill(mapX + mapW - 1, mapY, mapX + mapW, mapY + mapH, COLOR_MAP_EDGE);
+        graphics.fill(mapX, mapY, mapX + mapW, mapY + mapH, UiTheme.mapBackdrop());
+        graphics.fill(mapX, mapY, mapX + mapW, mapY + 1, UiTheme.mapEdge());
+        graphics.fill(mapX, mapY + mapH - 1, mapX + mapW, mapY + mapH, UiTheme.mapEdge());
+        graphics.fill(mapX, mapY, mapX + 1, mapY + mapH, UiTheme.mapEdge());
+        graphics.fill(mapX + mapW - 1, mapY, mapX + mapW, mapY + mapH, UiTheme.mapEdge());
 
         int minX = mapX;
         int minY = mapY;
@@ -472,7 +787,7 @@ public final class MainScreen extends Screen {
         Route route = Navigation.route();
         if (route.isPresent()) {
             HudDraw.emitPath(sink, route.points(), pathM00(), 0, pathM02(), 0, pathM11(),
-                    pathM12(), 1.6, COLOR_ROUTE, 0xFF, minX, minY, maxX, maxY);
+                    pathM12(), 1.6, UiTheme.route(), 0xFF, minX, minY, maxX, maxY);
         }
 
         // Places, and the labels to draw after the shapes. The names are thinned by the same rule
@@ -486,7 +801,12 @@ public final class MainScreen extends Screen {
                 continue;
             }
             HudDraw.emitPlaceMarker(sink, sx, sy, HudDraw.PLACE_MARKER_SMALL_PX * 0.5,
-                    HudDraw.COLOR_PLACE);
+                    UiTheme.place());
+            if (PlaceDetailStore.isFavorite(place)) {
+                // The badge is one more shape in the same block as the marker, before any text: a
+                // star emitted later would be writing into a buffer a string has already flushed.
+                HudDraw.emitStar(sink, sx + 3.0, sy - 3.0, FAVOURITE_BADGE_RADIUS, UiTheme.accent());
+            }
             if (!names) {
                 continue;
             }
@@ -510,7 +830,7 @@ public final class MainScreen extends Screen {
             double sx = screenX(target.x());
             double sy = screenY(target.z());
             if (sx >= minX && sx < maxX && sy >= minY && sy < maxY) {
-                HudDraw.emitPlaceMarker(sink, sx, sy, 4.0, 0xFFFF6B6B);
+                HudDraw.emitPlaceMarker(sink, sx, sy, 4.0, UiTheme.destination());
             }
         }
 
@@ -584,19 +904,78 @@ public final class MainScreen extends Screen {
         double leftY = sy - fz * 3 + pz * 3.2;
         double rightX = sx - fx * 3 - px * 3.2;
         double rightY = sy - fz * 3 - pz * 3.2;
-        HudDraw.emitTriangle(sink, tipX, tipY, leftX, leftY, rightX, rightY, COLOR_PLAYER);
+        HudDraw.emitTriangle(sink, tipX, tipY, leftX, leftY, rightX, rightY, UiTheme.player());
+    }
+
+    /**
+     * The one-line description of the place under the cursor, when there is one.
+     *
+     * <p>Beside the cursor rather than in a fixed line, and clamped inside the map: a fixed line
+     * would either cover the hint at the foot of the map or point at nothing, and a summary outside
+     * the map's frame would read as part of the panel. Only the first line of the description is
+     * shown -- this is a signpost, and the whole text is the details card's job.
+     */
+    private void drawHoverSummary(GuiGraphics graphics, Destination place, int mouseX, int mouseY) {
+        String summary = PlaceText.summary(font,
+                PlaceDetailStore.detailsOf(place).description(), Math.max(1, mapW - 16));
+        if (summary.isEmpty()) {
+            return;
+        }
+        int textW = font.width(summary);
+        int x = Mth.clamp(mouseX + 10, mapX + 2, Math.max(mapX + 2, mapX + mapW - textW - 2));
+        int y = mouseY - 12;
+        if (y < mapY + 2) {
+            y = mouseY + 12;
+        }
+        y = Mth.clamp(y, mapY + 2, Math.max(mapY + 2, mapY + mapH - LINE_HEIGHT - 2));
+        graphics.drawString(font, summary, x, y, UiTheme.mapLabelStrong(), false);
+    }
+
+    /**
+     * The details card of the selected place, docked in the map's bottom-right corner.
+     *
+     * <p>Inside the map and not beside it: the card belongs to the place under it, and the map is
+     * what the player is reading. The height is what the content asks for, clamped to the room the
+     * map has, so a small window shortens the card rather than pushing it over the buttons. Nothing
+     * here writes: a favourite toggle or a delete is reported by the card and routed by this screen.
+     */
+    private void drawDetailPanel(GuiGraphics graphics, int mouseX, int mouseY) {
+        if (selectedPlace == null) {
+            return;
+        }
+        Destination place = liveSelectedPlace();
+        if (place == null) {
+            // Nothing a source lists now, so there is no place to describe: closing is the only
+            // honest answer, and it also takes away buttons that could only fail.
+            selectedPlace = null;
+            return;
+        }
+        selectedPlace = place;
+        PlaceDetails details = PlaceDetailStore.detailsOf(place);
+        int width = Math.min(DETAIL_PANEL_WIDTH, mapW - DETAIL_PANEL_MARGIN * 2);
+        int height = Math.min(PlaceDetailPanel.preferredHeight(font, width, details),
+                mapH - DETAIL_PANEL_MARGIN * 2);
+        if (width <= 0 || height <= 0) {
+            // A window too small to hold even a card: the map is the only thing worth drawing, and
+            // the card comes back as soon as there is room for it.
+            return;
+        }
+        int x = mapX + mapW - DETAIL_PANEL_MARGIN - width;
+        int y = mapY + mapH - DETAIL_PANEL_MARGIN - height;
+        detailPanel.render(graphics, font, x, y, width, height, place, details,
+                PlaceDetailPanel.Options.STANDARD, false, mouseX, mouseY);
     }
 
     /** Every string on the screen, after every shape. */
-    private void drawText(GuiGraphics graphics, List<MapLabel> labels) {
+    private void drawText(GuiGraphics graphics, List<MapLabel> labels, int mouseX, int mouseY) {
         var font = this.font;
 
-        graphics.drawString(font, this.title, panelX + PAD, panelY + PAD, COLOR_TITLE, false);
+        graphics.drawString(font, this.title, panelX + PAD, panelY + PAD, UiTheme.title(), false);
 
         Destination target = Navigation.target();
         int y = statusY;
         graphics.drawString(font, Component.translatable("screen.howtogo.main.mode_now",
-                Navigation.mode().label()).getString(), panelX + PAD, y, COLOR_TEXT, false);
+                Navigation.mode().label()).getString(), panelX + PAD, y, UiTheme.text(), false);
         y += LINE_HEIGHT;
         if (target != null) {
             String line = Navigation.route().isPresent() && !Navigation.showArrival()
@@ -607,30 +986,43 @@ public final class MainScreen extends Screen {
                     : Component.translatable("screen.howtogo.main.navigating_no_route",
                             target.name()).getString();
             graphics.drawString(font, font.plainSubstrByWidth(line, panelW - PAD * 2),
-                    panelX + PAD, y, COLOR_TEXT, false);
+                    panelX + PAD, y, UiTheme.text(), false);
         } else {
             graphics.drawString(font, Component.translatable("screen.howtogo.main.idle").getString(),
-                    panelX + PAD, y, COLOR_DIM_TEXT, false);
+                    panelX + PAD, y, UiTheme.textMuted(), false);
         }
         y += LINE_HEIGHT;
         graphics.drawString(font, Component.translatable("screen.howtogo.main.stats",
                         RoadStore.get().segmentCount(),
                         RoadWeaverLayer.segments().size(),
                         Destinations.places().size()).getString(),
-                panelX + PAD, y, COLOR_DIM_TEXT, false);
+                panelX + PAD, y, UiTheme.textMuted(), false);
 
+        // The browser map's address has the last line of the status block to itself, and the notices
+        // stop one line above it. Both used to be placed independently -- the notices from the top of
+        // the block, the address from the foot of the panel -- and the two formulas landed on the
+        // same y, so with the browser map running a notice was painted straight over the address.
+        String webmap = WebMapService.url();
+        int addressY = firstButtonY - 2 - LINE_HEIGHT;
+        int lastNoticeY = webmap != null ? addressY - LINE_HEIGHT : firstButtonY - 2 - LINE_HEIGHT;
         for (String notice : notices) {
-            y += LINE_HEIGHT;
-            if (y > panelY + panelH - PAD - BUTTON_HEIGHT * 2 - GAP - LINE_HEIGHT) {
+            if (y + LINE_HEIGHT > lastNoticeY) {
                 break;
             }
+            y += LINE_HEIGHT;
             graphics.drawString(font, font.plainSubstrByWidth(notice, panelW - PAD * 2),
-                    panelX + PAD, y, COLOR_TEXT, false);
+                    panelX + PAD, y, UiTheme.text(), false);
         }
 
+        // The map's two hints: what a drag does, and the one gesture that opens the details card.
+        // Two lines rather than one joined sentence, because a separator between them would be
+        // punctuation hard-coded in Java, and at a narrow window each has to be cut on its own.
+        String placeHint = Component.translatable("screen.howtogo.main.place_hint").getString();
+        graphics.drawString(font, PlaceText.ellipsis(font, placeHint, mapW - 8), mapX + 4,
+                mapY + mapH - LINE_HEIGHT * 2 - 3, UiTheme.textMuted(), false);
         String hint = Component.translatable("screen.howtogo.main.map_hint").getString();
-        graphics.drawString(font, hint, mapX + 4,
-                mapY + mapH - LINE_HEIGHT - 2, COLOR_DIM_TEXT, false);
+        graphics.drawString(font, PlaceText.ellipsis(font, hint, mapW - 8), mapX + 4,
+                mapY + mapH - LINE_HEIGHT - 2, UiTheme.textMuted(), false);
 
         for (MapLabel label : labels) {
             int labelX = (int) Math.round(label.x());
@@ -638,17 +1030,26 @@ public final class MainScreen extends Screen {
             if (labelX < mapX || labelX >= mapX + mapW - 4 || labelY < mapY || labelY >= mapY + mapH) {
                 continue;
             }
-            graphics.drawString(font, label.name(), labelX, labelY, 0xFFE8EEF4, false);
+            graphics.drawString(font, label.name(), labelX, labelY, UiTheme.mapLabelStrong(), false);
         }
 
-        String webmap = WebMapService.url();
+        // The browser map's address, on the line reserved for it between the notices and the buttons.
         if (webmap != null) {
             String line = Component.translatable("screen.howtogo.main.webmap_running", webmap)
                     .getString();
             graphics.drawString(font, font.plainSubstrByWidth(line, panelW - PAD * 2),
-                    panelX + PAD, panelY + panelH - PAD - BUTTON_HEIGHT * 2 - GAP - 2
-                            - LINE_HEIGHT,
-                    COLOR_DIM_TEXT, false);
+                    panelX + PAD, addressY, UiTheme.textMuted(), false);
+        }
+
+        // The hover readout comes after every other string so a place name beside it cannot hide
+        // it. The card is drawn after this whole pass and may cover it, which is right: the card is
+        // the full text of what this line previews.
+        if (insideMap(mouseX, mouseY)
+                && (selectedPlace == null || !detailPanel.contains(mouseX, mouseY))) {
+            Destination hovered = placeAt(mouseX, mouseY);
+            if (hovered != null) {
+                drawHoverSummary(graphics, hovered, mouseX, mouseY);
+            }
         }
     }
 }
